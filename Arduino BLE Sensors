@@ -1,0 +1,57 @@
+#include <ArduinoBLE.h>
+
+int sensor1 = A0; // top left
+int sensor2 = A2; // top right
+int sensor3 = A1; // bottom middle
+
+// Create a BLE service
+BLEService sensorService("1101");
+
+// Create a BLE characteristic to send sensor values
+BLECharacteristic sensorCharacteristic("2101", BLERead | BLENotify, 32);
+
+void setup() {
+  Serial.begin(9600);
+  while (!Serial);
+
+  // Initialize BLE
+  if (!BLE.begin()) {
+    Serial.println("Starting BLE failed!");
+    while (1);
+  }
+
+  BLE.setLocalName("Nano33BLE_Sensors");
+  BLE.setAdvertisedService(sensorService);
+
+  sensorService.addCharacteristic(sensorCharacteristic);
+  BLE.addService(sensorService);
+
+  BLE.advertise();
+  Serial.println("🔵 BLE Sensor Peripheral Ready. Waiting for connections...");
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+
+  if (central) {
+    Serial.print("✅ Connected to central: ");
+    Serial.println(central.address());
+
+    while (central.connected()) {
+      int val1 = analogRead(sensor1);
+      int val2 = analogRead(sensor2);
+      int val3 = analogRead(sensor3);
+
+      // Pack the three values as comma-separated text
+      char buffer[32];
+      snprintf(buffer, sizeof(buffer), "%d,%d,%d", val1, val2, val3);
+
+      // Send over BLE
+      sensorCharacteristic.writeValue(buffer);
+
+      delay(50); // 20 updates per second
+    }
+
+    Serial.println("🔴 Disconnected from central.");
+  }
+}
