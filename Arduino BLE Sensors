@@ -12,7 +12,8 @@ BLECharacteristic sensorCharacteristic("2101", BLERead | BLENotify, 32);
 
 void setup() {
   Serial.begin(9600);
-  while (!Serial);
+  //delay(5);
+ // while (!Serial);
 
   // Initialize BLE
   if (!BLE.begin()) {
@@ -49,7 +50,7 @@ void loop() {
       // Send over BLE
       sensorCharacteristic.writeValue(buffer);
 
-      delay(50); // 20 updates per second
+      delay(5); // 20 updates per second
     }
 
     Serial.println("🔴 Disconnected from central.");
