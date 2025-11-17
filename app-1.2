@@ -1,0 +1,135 @@
+package com.example.myapplication
+
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.*
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.tooling.preview.Preview
+import androidx.compose.ui.unit.dp
+import com.example.myapplication.ui.theme.MyApplicationTheme
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        setContent {
+            MyApplicationTheme {
+                MyApp()
+            }
+        }
+    }
+}
+
+@Composable
+fun MyApp() {
+
+    var selectedTab by remember { mutableStateOf(0) }
+
+    val tabs = listOf(
+        BottomNavItem("Home", Icons.Default.Home),
+        BottomNavItem("Tutorials", Icons.Default.Info),
+        BottomNavItem("Gameplay", Icons.Default.PlayArrow),
+        BottomNavItem("Community", Icons.Default.Person)
+    )
+
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                tabs.forEachIndexed { index, item ->
+                    NavigationBarItem(
+                        selected = (index == selectedTab),
+                        onClick = { selectedTab = index },
+                        icon = { Icon(item.icon, contentDescription = item.label) },
+                        label = { Text(item.label) }
+                    )
+                }
+            }
+        }
+    ) { innerPadding ->
+        Box(modifier = Modifier.padding(innerPadding)) {
+            when (selectedTab) {
+                0 -> HomePage()
+                1 -> TutorialsPage()
+                2 -> GameplayPage()
+                3 -> CommunityPage()
+            }
+        }
+    }
+}
+
+data class BottomNavItem(
+    val label: String,
+    val icon: ImageVector
+)
+
+@Composable
+fun HomePage() {
+    Column(
+        Modifier.fillMaxSize(),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Image(
+            painter = painterResource(id = R.drawable.nexshot),
+            contentDescription = "App Logo",
+            modifier = Modifier.size(200.dp)
+        )
+
+        Spacer(modifier = Modifier.height(20.dp))
+
+        Text("Welcome to NexShot!", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+@Composable
+fun TutorialsPage() {
+    Column(
+        Modifier
+            .fillMaxSize()
+            .padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text("Tutorials Page", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+@Composable
+fun GameplayPage() {
+    Box(
+        Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Text("Gameplay Page", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+@Composable
+fun CommunityPage() {
+    Box(
+        Modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        Text("Community Page", style = MaterialTheme.typography.headlineMedium)
+    }
+}
+
+@Preview(showBackground = true)
+@Composable
+fun AppPreview() {
+    MyApplicationTheme {
+        MyApp()
+    }
+}
