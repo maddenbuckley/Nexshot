@@ -56,7 +56,7 @@ async def ble_thread_function():
         await client.start_notify(CHAR_UUID, lambda s, d: parse_triplet(d))
 
         while True:
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.005)
 
 
 def start_ble_thread():
