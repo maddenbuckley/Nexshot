@@ -1,0 +1,192 @@
+import asyncio
+import threading
+from bleak import BleakScanner, BleakClient
+
+import time
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib as mpl
+import math
+
+from matplotlib.animation import FFMpegWriter
+import imageio_ffmpeg as iioff
+
+# BLE Setup
+
+DEVICE_NAME = "Nano33BLE_Sensors"
+CHAR_UUID = "2101"
+
+latest_triplet = None
+
+
+def parse_triplet(data):
+    """Parse incoming BLE data into three integers."""
+    global latest_triplet
+    try:
+        text = data.decode().strip()
+        parts = text.split(",")
+        if len(parts) == 3:
+            latest_triplet = [int(p) for p in parts]
+    except Exception:
+        pass
+
+
+async def ble_thread_function():
+    print("🔍 Scanning for BLE devices...")
+    device = None
+    devices = await BleakScanner.discover(timeout=5.0)
+
+    for d in devices:
+        print(f"Found: {d.name}")
+        if d.name and DEVICE_NAME in d.name:
+            device = d
+
+    if device is None:
+        print("❌ BLE device not found.")
+        return
+
+    print("✅ Connecting to:", device.name)
+    async with BleakClient(device.address) as client:
+        if not client.is_connected:
+            print("❌ Could not connect.")
+            return
+
+        print("✅ BLE Connected!")
+
+        await client.start_notify(CHAR_UUID, lambda s, d: parse_triplet(d))
+
+        while True:
+            await asyncio.sleep(0.05)
+
+
+def start_ble_thread():
+    """Start BLE listener in a separate thread."""
+    loop = asyncio.new_event_loop()
+    threading.Thread(
+        target=loop.run_until_complete,
+        args=(ble_thread_function(),),
+        daemon=True
+    ).start()
+
+
+# Start BLE thread
+start_ble_thread()
+
+# Heatmap Setup
+
+fig_hm, ax_hm = plt.subplots(figsize=(6, 5))
+
+x = np.linspace(-10, 110, 200)
+y = np.linspace(-10, 110, 200)
+X, Y = np.meshgrid(x, y)
+sigma = 12.0  # Gaussian spread
+
+Z = np.zeros_like(X)
+heatmap = ax_hm.pcolormesh(X, Y, Z, shading='auto', cmap='hot')
+plt.colorbar(heatmap, ax=ax_hm)
+
+ax_hm.set_xlim(-10, 110)
+ax_hm.set_ylim(-10, 110)
+ax_hm.set_title("Live Heatmap – Latest Intersection")
+ax_hm.set_xlabel("X Position")
+ax_hm.set_ylabel("Y Position")
+
+last_dot = None
+
+# sensor coordinates
+a_x = 0; a_y = 100
+b_x = 100; b_y = 100
+c_x = 50; c_y = 100 - math.sqrt(7500)
+
+# ---- MP4 Writer Setup ----
+OUT_MP4 = "threshold_heatmap_BLE.mp4"
+fps = 10
+dpi = 150
+bitrate = 1800
+mpl.rcParams['animation.ffmpeg_path'] = iioff.get_ffmpeg_exe()
+writer = FFMpegWriter(fps=fps, bitrate=bitrate)
+
+print("✅ Waiting for BLE data...")
+frame_count = 0
+
+# Threshold / Filtering Setup
+
+sensor_threshold = 30   # ignore low sensor readings
+change_threshold = 10   # ignore small changes between frames
+movement_threshold = 5  # ignore tiny intersection movements
+
+prev_triplet = None
+prev_x, prev_y = None, None
+
+# Live Loop + Recording
+
+try:
+    with writer.saving(fig_hm, OUT_MP4, dpi):
+        frame_count = 0
+        print(f"🎥 Recording to {OUT_MP4}...")
+
+        while True:
+            if latest_triplet is None:
+                time.sleep(0.01)
+                continue
+
+            A, B, C = latest_triplet
+
+            # --- THRESHOLD 1: Skip weak readings ---
+            if A < sensor_threshold and B < sensor_threshold and C < sensor_threshold:
+                continue
+
+            # --- THRESHOLD 2: Skip minimal sensor changes ---
+            if prev_triplet is not None:
+                diff = np.abs(np.array(latest_triplet) - np.array(prev_triplet))
+                if np.all(diff < change_threshold):
+                    continue
+            prev_triplet = latest_triplet.copy()
+
+            # Midpoints
+            CA_unit = A / (A + C) if (A + C) != 0 else 0.5
+            CB_unit = B / (C + B) if (C + B) != 0 else 0.5
+
+            CA_x = CA_unit * (a_x - c_x) + c_x
+            CA_y = CA_unit * (a_y - c_y) + c_y
+            CB_x = CB_unit * (b_x - c_x) + c_x
+            CB_y = CB_unit * (b_y - c_y) + c_y
+
+            # Intersection calculation
+            try:
+                slope1 = (b_y - CA_y) / (b_x - CA_x)
+                slope2 = (a_y - CB_y) / (a_x - CB_x)
+                i1 = CA_y - slope1 * CA_x
+                i2 = CB_y - slope2 * CB_x
+                x_inter = (i2 - i1) / (slope1 - slope2)
+                y_inter = slope1 * x_inter + i1
+            except ZeroDivisionError:
+                continue
+
+            # --- THRESHOLD 3: Skip tiny intersection movements ---
+            if prev_x is not None and prev_y is not None:
+                dist = math.hypot(x_inter - prev_x, y_inter - prev_y)
+                if dist < movement_threshold:
+                    continue
+            prev_x, prev_y = x_inter, y_inter
+
+            # Update Heatmap
+            
+            Z = np.exp(-((X - x_inter) ** 2 + (Y - y_inter) ** 2) / (2 * sigma ** 2))
+            heatmap.set_array(Z.ravel())
+
+            if last_dot is not None:
+                last_dot.remove()
+
+            last_dot = ax_hm.plot(x_inter, y_inter, 'bo', markersize=10)[0]
+
+            plt.pause(0.001)
+
+            # Save current frame to video
+            writer.grab_frame()
+            frame_count += 1
+
+except KeyboardInterrupt:
+    print(f"✅ Stopped by user. {frame_count} frames saved to {OUT_MP4}.")
+
+plt.show()
