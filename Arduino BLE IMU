@@ -1,0 +1,61 @@
+#include <ArduinoBLE.h>
+#include <Arduino_LSM9DS1.h>
+
+// Define a BLE Service
+BLEService imuService("1101");
+
+// Define characteristics for accelerometer and gyroscope
+BLECharacteristic accelCharacteristic("2101", BLERead | BLENotify, 32);
+BLECharacteristic gyroCharacteristic("2102", BLERead | BLENotify, 32);
+
+void setup() {
+  // Start IMU
+  if (!IMU.begin()) {
+    while (1);
+  }
+
+  // Start BLE
+  if (!BLE.begin()) {
+    while (1);
+  }
+
+  BLE.setLocalName("Nano33BLE_IMU");
+  BLE.setAdvertisedService(imuService);
+
+  imuService.addCharacteristic(accelCharacteristic);
+  imuService.addCharacteristic(gyroCharacteristic);
+  BLE.addService(imuService);
+
+  // Start advertising
+  BLE.advertise();
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+
+  if (central) {
+    while (central.connected()) {
+      float ax, ay, az;
+      float gx, gy, gz;
+
+      if (IMU.accelerationAvailable()) {
+        IMU.readAcceleration(ax, ay, az);
+      }
+      if (IMU.gyroscopeAvailable()) {
+        IMU.readGyroscope(gx, gy, gz);
+      }
+
+      // Pack data into text (you can also pack as binary if preferred)
+      char accelBuffer[32];
+      char gyroBuffer[32];
+      snprintf(accelBuffer, sizeof(accelBuffer), "%.2f,%.2f,%.2f", ax, ay, az);
+      snprintf(gyroBuffer, sizeof(gyroBuffer), "%.2f,%.2f,%.2f", gx, gy, gz);
+
+      // Send over BLE
+      accelCharacteristic.writeValue(accelBuffer);
+      gyroCharacteristic.writeValue(gyroBuffer);
+
+      delay(200); // 5 updates per second
+    }
+  }
+}
