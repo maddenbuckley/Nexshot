@@ -1,0 +1,129 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
+import math
+import time
+
+# BLE info
+DEVICE_NAME = "Nano33BLE_IMU"
+CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+# Complementary filter parameters
+alpha = 0.98  # gyroscope weight
+dt = 0.05     # sample time ~50 ms
+
+# Initial orientation angles
+roll = 0.0
+pitch = 0.0
+yaw = 0.0  # Yaw will drift without magnetometer
+
+async def run():
+    global roll, pitch, yaw
+
+    # Scan for the BLE device
+    print("Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    target = None
+    for d in devices:
+        if d.name == DEVICE_NAME:
+            target = d
+            break
+
+    if not target:
+        print(f"Device {DEVICE_NAME} not found")
+        return
+
+    async with BleakClient(target.address) as client:
+        print(f"Connected to {DEVICE_NAME}")
+
+        # Set up Matplotlib 3D plot
+        plt.ion()
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+
+        # Draw axes of a cube representing Arduino
+        cube_size = 1.0
+
+        def draw_orientation(roll, pitch, yaw):
+            # Rotation matrices
+            Rx = np.array([[1,0,0],
+                           [0,math.cos(roll),-math.sin(roll)],
+                           [0,math.sin(roll),math.cos(roll)]])
+            Ry = np.array([[math.cos(pitch),0,math.sin(pitch)],
+                           [0,1,0],
+                           [-math.sin(pitch),0,math.cos(pitch)]])
+            Rz = np.array([[math.cos(yaw),-math.sin(yaw),0],
+                           [math.sin(yaw),math.cos(yaw),0],
+                           [0,0,1]])
+            R = Rz @ Ry @ Rx
+
+            # Cube vertices
+            points = np.array([[-cube_size, -cube_size, -cube_size],
+                               [ cube_size, -cube_size, -cube_size],
+                               [ cube_size,  cube_size, -cube_size],
+                               [-cube_size,  cube_size, -cube_size],
+                               [-cube_size, -cube_size,  cube_size],
+                               [ cube_size, -cube_size,  cube_size],
+                               [ cube_size,  cube_size,  cube_size],
+                               [-cube_size,  cube_size,  cube_size]])
+
+            rotated = points @ R.T
+            ax.cla()
+            ax.set_xlim([-2,2])
+            ax.set_ylim([-2,2])
+            ax.set_zlim([-2,2])
+            ax.set_xlabel('X')
+            ax.set_ylabel('Y')
+            ax.set_zlabel('Z')
+
+            # Draw cube edges
+            edges = [(0,1),(1,2),(2,3),(3,0),
+                     (4,5),(5,6),(6,7),(7,4),
+                     (0,4),(1,5),(2,6),(3,7)]
+            for e in edges:
+                ax.plot([rotated[e[0],0], rotated[e[1],0]],
+                        [rotated[e[0],1], rotated[e[1],1]],
+                        [rotated[e[0],2], rotated[e[1],2]], 'b')
+
+            plt.draw()
+            plt.pause(0.001)
+
+        print("Receiving data... Press Ctrl+C to stop.")
+
+        try:
+            while True:
+                # Read BLE characteristic
+                value = await client.read_gatt_char(CHARACTERISTIC_UUID)
+                line = value.decode('utf-8').strip()
+                if line:
+                    ax_val, ay_val, az_val, gx_val, gy_val, gz_val = map(float, line.split(','))
+
+                    # Convert gyroscope degrees/sec to rad/sec if necessary
+                    gx = math.radians(gx_val)
+                    gy = math.radians(gy_val)
+                    gz = math.radians(gz_val)
+
+                    # Integrate gyro for angles
+                    roll_gyro = roll + gx * dt
+                    pitch_gyro = pitch + gy * dt
+                    yaw += gz * dt  # Yaw will drift
+
+                    # Compute roll/pitch from accelerometer
+                    roll_acc = math.atan2(ay_val, az_val)
+                    pitch_acc = math.atan2(-ax_val, math.sqrt(ay_val**2 + az_val**2))
+
+                    # Complementary filter
+                    roll = alpha * roll_gyro + (1-alpha) * roll_acc
+                    pitch = alpha * pitch_gyro + (1-alpha) * pitch_acc
+
+                    draw_orientation(roll, pitch, yaw)
+
+                await asyncio.sleep(dt)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+            plt.ioff()
+            plt.show()
+
+asyncio.run(run())
