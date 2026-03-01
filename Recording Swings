@@ -1,0 +1,111 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+import numpy as np
+
+# BLE info
+DEVICE_NAME = "Nano33BLE_IMU"
+CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+# Recording parameters
+DURATION = 10  # seconds
+DT = 0.03      # BLE read interval (~33 Hz)
+
+# Smoothing & animation parameters
+SCALE = 0.1
+ALPHA = 0.05
+WINDOW_SIZE = 5
+TRAIL_LENGTH = 20
+
+async def record_imu(duration=DURATION):
+    """Connect to BLE device and record IMU data to memory"""
+    print("Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    target = None
+    for d in devices:
+        if d.name == DEVICE_NAME:
+            target = d
+            break
+
+    if not target:
+        print(f"Device {DEVICE_NAME} not found")
+        return None
+
+    async with BleakClient(target.address) as client:
+        print(f"Connected to {DEVICE_NAME}")
+        x_data, y_data, z_data = [], [], []
+        start_time = asyncio.get_event_loop().time()
+        while asyncio.get_event_loop().time() - start_time < duration:
+            value = await client.read_gatt_char(CHARACTERISTIC_UUID)
+            line = value.decode("utf-8").strip()
+            if line:
+                ax_val, ay_val, az_val, gx_val, gy_val, gz_val = map(float, line.split(","))
+                x_data.append(ax_val * SCALE)
+                y_data.append(ay_val * SCALE)
+                z_data.append(az_val * SCALE)
+            await asyncio.sleep(DT)
+        return np.array(x_data), np.array(y_data), np.array(z_data)
+
+def smooth_data(x, y, z):
+    """Low-pass filter + moving average"""
+    x_filt, y_filt, z_filt = [], [], []
+    x_prev, y_prev, z_prev = 0.0, 0.0, 0.0
+    for i in range(len(x)):
+        xf = ALPHA * x[i] + (1 - ALPHA) * x_prev
+        yf = ALPHA * y[i] + (1 - ALPHA) * y_prev
+        zf = ALPHA * z[i] + (1 - ALPHA) * z_prev
+        x_prev, y_prev, z_prev = xf, yf, zf
+        x_filt.append(xf)
+        y_filt.append(yf)
+        z_filt.append(zf)
+
+    def moving_average(data, window=WINDOW_SIZE):
+        return np.convolve(data, np.ones(window)/window, mode='same')
+
+    return moving_average(x_filt), moving_average(y_filt), moving_average(z_filt)
+
+def animate_swing(x_smooth, y_smooth, z_smooth):
+    """Animate the paddle swing in 3D"""
+    fig = plt.figure()
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_xlim([-0.05, 0.05])
+    ax.set_ylim([-0.05, 0.05])
+    ax.set_zlim([-0.05, 0.05])
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+
+    trail, = ax.plot([], [], [], '-o', markersize=4, color='red')
+    point, = ax.plot([], [], [], 'o', markersize=8, color='blue')
+
+    def update(frame):
+        start = max(0, frame-TRAIL_LENGTH)
+        xs = x_smooth[start:frame]
+        ys = y_smooth[start:frame]
+        zs = z_smooth[start:frame]
+        trail.set_data(xs, ys)
+        trail.set_3d_properties(zs)
+
+        # Current point as a sequence
+        point.set_data([x_smooth[frame]], [y_smooth[frame]])
+        point.set_3d_properties([z_smooth[frame]])
+        return trail, point
+
+    ani = FuncAnimation(fig, update, frames=len(x_smooth), interval=30, blit=True)
+    plt.show()
+
+async def main():
+    # Record IMU
+    data = await record_imu()
+    if data is None:
+        return
+    x, y, z = data
+
+    # Smooth data
+    x_smooth, y_smooth, z_smooth = smooth_data(x, y, z)
+
+    # Animate
+    animate_swing(x_smooth, y_smooth, z_smooth)
+
+asyncio.run(main())
