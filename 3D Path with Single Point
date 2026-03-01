@@ -1,0 +1,95 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+import matplotlib.pyplot as plt
+import numpy as np
+
+# BLE info
+DEVICE_NAME = "Nano33BLE_IMU"
+CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+# Visualization parameters
+SCALE = 0.1           # accelerometer scaling
+MAX_TRAIL = 10        # number of points to keep in the trail
+ALPHA = 0.2           # low-pass filter coefficient (smaller = smoother)
+DT = 0.02             # BLE read interval (~50 Hz)
+
+# Initialize filtered values
+x_filt, y_filt, z_filt = 0.0, 0.0, 0.0
+
+async def run():
+    global x_filt, y_filt, z_filt
+
+    print("Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    target = None
+    for d in devices:
+        if d.name == DEVICE_NAME:
+            target = d
+            break
+
+    if not target:
+        print(f"Device {DEVICE_NAME} not found")
+        return
+
+    async with BleakClient(target.address) as client:
+        print(f"Connected to {DEVICE_NAME}")
+
+        # Set up 3D plot
+        plt.ion()
+        fig = plt.figure()
+        ax = fig.add_subplot(111, projection='3d')
+        ax.set_xlim([-2, 2])
+        ax.set_ylim([-2, 2])
+        ax.set_zlim([-2, 2])
+        ax.set_xlabel('X')
+        ax.set_ylabel('Y')
+        ax.set_zlabel('Z')
+
+        positions = []
+
+        try:
+            while True:
+                # Read BLE characteristic
+                value = await client.read_gatt_char(CHARACTERISTIC_UUID)
+                line = value.decode('utf-8').strip()
+                if line:
+                    # ax,ay,az,gx,gy,gz
+                    ax_val, ay_val, az_val, gx_val, gy_val, gz_val = map(float, line.split(','))
+
+                    # Scale for visualization
+                    x = ax_val * SCALE
+                    y = ay_val * SCALE
+                    z = az_val * SCALE
+
+                    # Low-pass filter
+                    x_filt = ALPHA * x + (1 - ALPHA) * x_filt
+                    y_filt = ALPHA * y + (1 - ALPHA) * y_filt
+                    z_filt = ALPHA * z + (1 - ALPHA) * z_filt
+
+                    # Append filtered position
+                    positions.append([x_filt, y_filt, z_filt])
+                    positions = positions[-MAX_TRAIL:]  # keep last N points
+
+                    # Clear and plot
+                    ax.cla()
+                    ax.set_xlim([-0.2, 0.2])
+                    ax.set_ylim([-0.2, 0.2])
+                    ax.set_zlim([-0.2, 0.2])
+                    ax.set_xlabel('X')
+                    ax.set_ylabel('Y')
+                    ax.set_zlabel('Z')
+
+                    pos_array = np.array(positions)
+                    ax.plot(pos_array[:,0], pos_array[:,1], pos_array[:,2], '-o', markersize=4, color='red')
+
+                    plt.draw()
+                    plt.pause(0.001)
+
+                await asyncio.sleep(DT)
+
+        except KeyboardInterrupt:
+            print("Stopped tracking paddle swing")
+            plt.ioff()
+            plt.show()
+
+asyncio.run(run())
