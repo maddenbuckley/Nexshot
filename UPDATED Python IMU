@@ -1,0 +1,40 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+import time
+
+# BLE characteristic UUID from your Arduino
+CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+DEVICE_NAME = "Nano33BLE_IMU"  # The name your Arduino advertises
+
+async def run():
+    print("Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    
+    target = None
+    for d in devices:
+        print(f"Found: {d.name} ({d.address})")
+        if d.name == DEVICE_NAME:
+            target = d
+            break
+
+    if not target:
+        print(f"Could not find {DEVICE_NAME}!")
+        return
+
+    async with BleakClient(target.address) as client:
+        print(f"Connected to {DEVICE_NAME} ({target.address})")
+        print("ax,ay,az,gx,gy,gz")  # CSV header
+
+        try:
+            while True:
+                # Read characteristic value
+                value = await client.read_gatt_char(CHARACTERISTIC_UUID)
+                line = value.decode('utf-8').strip()
+                if line:
+                    print(line)
+                await asyncio.sleep(0.1)  # 100 ms polling rate (~10 Hz)
+        except KeyboardInterrupt:
+            print("\nExiting...")
+
+# Run the asyncio loop
+asyncio.run(run())
