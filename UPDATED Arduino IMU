@@ -1,0 +1,79 @@
+#include <ArduinoBLE.h>
+#include <Arduino_LSM9DS1.h>
+
+String m;
+
+//BLEService customService("180C");
+//BLEStringCharacteristic ble_imu("2A58", BLERead | BLENotify, 50);
+
+BLEService customService("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLEStringCharacteristic ble_imu("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 50);
+
+void readValues();
+
+void setup() {
+  IMU.begin();
+  Serial.begin(9600);
+  //while (!Serial);
+  if (!BLE.begin())
+  {
+    Serial.println("BLE failed");
+    while (1);    
+  }
+
+  BLE.setLocalName("Arduino Environment");
+  
+  BLE.setAdvertisedService(customService);
+  
+  customService.addCharacteristic(ble_imu);
+  
+  BLE.addService(customService);
+  
+  BLE.advertise();
+
+  Serial.println("Bluetooth device is now active, waiting for connecrion...");
+}
+
+void loop() {
+
+  BLEDevice central = BLE.central();
+  if (central) 
+  {
+    Serial.print("Connected to central: ");
+    Serial.println(central.address());
+    while (central.connected()) 
+    {
+      delay(200);
+      
+      readValues();
+
+      ble_imu.writeValue(m);
+
+      Serial.println("Reading Sensors");
+      Serial.println(m);
+      Serial.println("\n");
+      delay(1000);
+    }
+  }
+    Serial.println("Disconnected from central: ");
+    Serial.println(central.address());
+}
+
+void readValues()
+{
+  float ax, ay, az;
+  float gx, gy, gz;
+
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+    IMU.readAcceleration(ax, ay, az);
+    IMU.readGyroscope(gx, gy, gz);
+
+    // CSV format: ax,ay,az,gx,gy,gz
+    m = String(ax, 3) + "," +
+        String(ay, 3) + "," +
+        String(az, 3) + "," +
+        String(gx, 3) + "," +
+        String(gy, 3) + "," +
+        String(gz, 3);
+  }
+}
