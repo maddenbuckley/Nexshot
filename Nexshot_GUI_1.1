@@ -1,0 +1,115 @@
+import os
+import sys
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QFileDialog, QMessageBox
+)
+from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtCore import Qt
+
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+
+class PaddleViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plotter = QtInteractor(self)
+        main = QVBoxLayout(self)
+        main.addWidget(self.plotter.interactor)
+
+        bar = QHBoxLayout()
+        self.back_btn = QPushButton("Back")
+        bar.addWidget(self.back_btn)
+        bar.addStretch()
+        main.addLayout(bar)
+
+    def load_default(self):
+        path = os.path.join(os.getcwd(), "paddle.stl")
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing file", f"Could not find: {path}")
+            return
+        try:
+            mesh = pv.read(path)
+            self.plotter.clear()
+            self.plotter.add_axes()
+            self.plotter.add_mesh(mesh, show_edges=False, smooth_shading=True, color="darkgreen")
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load STL:\n{e}")
+
+
+class NexshotMain(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Nexshot")
+        self.resize(1000, 700)
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self._build_welcome()
+        self._build_paddle()
+
+    def _build_welcome(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 20, 20, 20)
+
+        icon_path = os.path.join(os.getcwd(), "nexshot_icon.png")
+        if os.path.exists(icon_path):
+            pix = QPixmap(icon_path).scaledToWidth(360)
+            img = QLabel()
+            img.setPixmap(pix)
+            img.setAlignment(Qt.AlignCenter)
+            v.addWidget(img, alignment=Qt.AlignCenter)
+
+        title = QLabel("Welcome to Nexshot")
+        title.setFont(QFont("Arial", 28))
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title, alignment=Qt.AlignCenter)
+        v.addStretch()
+
+        btn_row = QHBoxLayout()
+        self.game_btn = QPushButton("Gameplay")
+        self.paddle_btn = QPushButton("Our Paddle")
+        btn_row.addStretch()
+        btn_row.addWidget(self.game_btn)
+        btn_row.addWidget(self.paddle_btn)
+        btn_row.addStretch()
+        v.addLayout(btn_row)
+
+        self.game_btn.clicked.connect(self._show_gameplay)
+        self.paddle_btn.clicked.connect(self._show_paddle)
+
+        self.stack.addWidget(w)
+
+    def _build_paddle(self):
+        self.paddle_page = PaddleViewer()
+        self.paddle_page.back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.stack.addWidget(self.paddle_page)
+
+    def _show_gameplay(self):
+        QMessageBox.information(self, "Gameplay", "Gameplay screen placeholder")
+
+    def _show_paddle(self):
+        # Switch to paddle page and load the default paddle immediately
+        self.stack.setCurrentWidget(self.paddle_page)
+        try:
+            self.paddle_page.load_default()
+        except Exception:
+            # load_default handles its own errors; ignore here to avoid crashing UI
+            pass
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = NexshotMain()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
