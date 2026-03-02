@@ -1,0 +1,548 @@
+import asyncio
+from bleak import BleakClient, BleakScanner
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from mpl_toolkits.mplot3d import Axes3D
+import numpy as np
+import csv
+from datetime import datetime
+from scipy.signal import savgol_filter
+
+# ============ BLE Configuration ============
+DEVICE_NAME = "Nano33BLE_IMU"
+CHARACTERISTIC_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+# ============ Recording Parameters ============
+RECORDING_DURATION = 10  # seconds
+BLE_READ_INTERVAL = 0.03  # ~33 Hz
+
+# ============ Signal Processing (Smoothing) ============
+ACCELERATION_SCALE = 0.1
+LOW_PASS_ALPHA = 0.05          # Lower = smoother (0.05 is more aggressive than 0.1)
+MOVING_AVG_WINDOW = 7          # Increased from 5 for more smoothing
+SAVGOL_WINDOW = 11             # Savitzky-Golay window size (must be odd)
+SAVGOL_POLYORDER = 3           # Polynomial order
+USE_SAVGOL = True              # Use Savitzky-Golay for extra smoothing
+TRAIL_LENGTH = 30
+
+
+async def connect_and_record_imu(duration=RECORDING_DURATION):
+    """
+    Connect to Arduino Nano via BLE and record IMU data (accelerometer + gyroscope)
+    
+    Args:
+        duration: Recording time in seconds
+        
+    Returns:
+        Dictionary with accelerometer (ax, ay, az) and gyroscope (gx, gy, gz) data
+    """
+    print(f"\n[*] Scanning for BLE devices...")
+    devices = await BleakScanner.discover()
+    
+    # Find target device
+    target_device = None
+    for device in devices:
+        if device.name == DEVICE_NAME:
+            target_device = device
+            break
+    
+    if not target_device:
+        print(f"[!] Device '{DEVICE_NAME}' not found")
+        print(f"[*] Available devices: {[d.name for d in devices if d.name]}")
+        return None
+    
+    print(f"[✓] Found {DEVICE_NAME} at {target_device.address}")
+    
+    # Connect and record data
+    accel_data = {"x": [], "y": [], "z": []}
+    gyro_data = {"x": [], "y": [], "z": []}
+    timestamps = []
+    
+    try:
+        async with BleakClient(target_device.address) as client:
+            print(f"[✓] Connected to {DEVICE_NAME}")
+            print(f"[*] Recording for {duration} seconds...")
+            
+            start_time = asyncio.get_event_loop().time()
+            frame_count = 0
+            
+            while asyncio.get_event_loop().time() - start_time < duration:
+                try:
+                    # Read data from BLE characteristic
+                    value = await client.read_gatt_char(CHARACTERISTIC_UUID)
+                    data_string = value.decode("utf-8").strip()
+                    
+                    if data_string:
+                        # Parse: ax, ay, az, gx, gy, gz
+                        values = list(map(float, data_string.split(",")))
+                        if len(values) >= 6:
+                            ax, ay, az, gx, gy, gz = values[:6]
+                            
+                            # Store data
+                            accel_data["x"].append(ax)
+                            accel_data["y"].append(ay)
+                            accel_data["z"].append(az)
+                            gyro_data["x"].append(gx)
+                            gyro_data["y"].append(gy)
+                            gyro_data["z"].append(gz)
+                            timestamps.append(asyncio.get_event_loop().time() - start_time)
+                            
+                            frame_count += 1
+                            if frame_count % 10 == 0:
+                                print(f"  [{frame_count}] ax={ax:.2f}, ay={ay:.2f}, az={az:.2f}")
+                
+                except ValueError as e:
+                    print(f"[!] Parse error: {e}")
+                
+                await asyncio.sleep(BLE_READ_INTERVAL)
+            
+            print(f"[✓] Recording complete. Captured {frame_count} frames")
+            
+    except Exception as e:
+        print(f"[!] Error during recording: {e}")
+        return None
+    
+    return {
+        "accel": accel_data,
+        "gyro": gyro_data,
+        "timestamps": timestamps
+    }
+
+
+def smooth_data(data):
+    """
+    Apply multi-stage smoothing: low-pass filter → moving average → Savitzky-Golay
+    
+    Args:
+        data: Dictionary with x, y, z arrays
+        
+    Returns:
+        Smoothed data dictionary
+    """
+    smoothed = {"x": [], "y": [], "z": []}
+    
+    for axis in ["x", "y", "z"]:
+        # Stage 1: Low-pass filter (IIR - infinite impulse response)
+        filtered = []
+        prev = 0.0
+        for value in data[axis]:
+            curr = LOW_PASS_ALPHA * value + (1 - LOW_PASS_ALPHA) * prev
+            filtered.append(curr)
+            prev = curr
+        
+        # Stage 2: Moving average
+        kernel = np.ones(MOVING_AVG_WINDOW) / MOVING_AVG_WINDOW
+        smoothed_ma = np.convolve(filtered, kernel, mode='same')
+        
+        # Stage 3: Savitzky-Golay filter (preserves peaks while smoothing)
+        if USE_SAVGOL and len(smoothed_ma) > SAVGOL_WINDOW:
+            smoothed[axis] = savgol_filter(smoothed_ma, SAVGOL_WINDOW, SAVGOL_POLYORDER)
+        else:
+            smoothed[axis] = smoothed_ma
+    
+    return smoothed
+
+
+def save_data_to_csv(accel_data, gyro_data, timestamps, filename="imu_recording.csv"):
+    """Save IMU data to CSV file"""
+    with open(filename, 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['Time(s)', 'Ax', 'Ay', 'Az', 'Gx', 'Gy', 'Gz'])
+        
+        for i, t in enumerate(timestamps):
+            row = [
+                f"{t:.3f}",
+                f"{accel_data['x'][i]:.4f}",
+                f"{accel_data['y'][i]:.4f}",
+                f"{accel_data['z'][i]:.4f}",
+                f"{gyro_data['x'][i]:.4f}",
+                f"{gyro_data['y'][i]:.4f}",
+                f"{gyro_data['z'][i]:.4f}"
+            ]
+            writer.writerow(row)
+    
+    print(f"[✓] Data saved to {filename}")
+
+
+def animate_all_data(accel_smooth, gyro_smooth, timestamps):
+    """
+    Create animated visualization of 10 seconds of IMU data
+    Shows 3D trajectory, 3D rotating cube, and time-series data updating in real-time
+    """
+    # Pre-calculate angular displacement for animation
+    dt = np.mean(np.diff(timestamps)) if len(timestamps) > 1 else 0.03
+    angle_x = np.cumsum(gyro_smooth["x"]) * dt
+    angle_y = np.cumsum(gyro_smooth["y"]) * dt
+    angle_z = np.cumsum(gyro_smooth["z"]) * dt
+    gyro_magnitude = np.sqrt(
+        gyro_smooth["x"]**2 + gyro_smooth["y"]**2 + gyro_smooth["z"]**2
+    )
+    
+    # Create figure with 4 subplots
+    fig = plt.figure(figsize=(15, 12))
+    
+    # 3D Accelerometer plot
+    ax1 = fig.add_subplot(2, 2, 1, projection='3d')
+    ax1.set_xlim([-0.5, 0.5])
+    ax1.set_ylim([-0.5, 0.5])
+    ax1.set_zlim([-0.5, 0.5])
+    ax1.set_xlabel('X Acceleration')
+    ax1.set_ylabel('Y Acceleration')
+    ax1.set_zlabel('Z Acceleration')
+    ax1.set_title('3D Accelerometer Trajectory')
+    line_3d, = ax1.plot([], [], [], 'b-', linewidth=1, alpha=0.7)
+    point_3d, = ax1.plot([], [], [], 'ro', markersize=8)
+    
+    # 3D Rotating Cube plot
+    ax2 = fig.add_subplot(2, 2, 2, projection='3d')
+    ax2.set_xlim([-0.5, 0.5])
+    ax2.set_ylim([-0.5, 0.5])
+    ax2.set_zlim([-0.5, 0.5])
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    ax2.set_zlabel('Z')
+    ax2.set_title('3D Angular Motion - Rotating Cube')
+    
+    # Time-series accelerometer
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax3.set_xlim([0, max(timestamps)])
+    ax3.set_ylim([-0.5, 0.5])
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Acceleration')
+    ax3.set_title('Accelerometer Time-Series')
+    ax3.grid(True, alpha=0.3)
+    line_x, = ax3.plot([], [], 'r-', linewidth=1.5, label='Ax')
+    line_y, = ax3.plot([], [], 'g-', linewidth=1.5, label='Ay')
+    line_z, = ax3.plot([], [], 'b-', linewidth=1.5, label='Az')
+    ax3.legend(loc='upper left')
+    
+    # Angular velocity magnitude
+    ax4 = fig.add_subplot(2, 2, 4)
+    ax4.set_xlim([0, max(timestamps)])
+    ax4.set_ylim([0, max(gyro_magnitude) * 1.1 if len(gyro_magnitude) > 0 else 1])
+    ax4.set_xlabel('Time (s)')
+    ax4.set_ylabel('Angular Velocity (rad/s)')
+    ax4.set_title('Total Rotation Speed')
+    ax4.grid(True, alpha=0.3)
+    line_gyro, = ax4.plot([], [], 'purple', linewidth=2)
+    
+    # Time text
+    time_text = fig.text(0.5, 0.02, '', ha='center', fontsize=14, fontweight='bold')
+    
+    def rotation_matrix_3d(rx, ry, rz):
+        """Create 3D rotation matrix from Euler angles (XYZ convention)"""
+        # Rotation around X axis
+        Rx = np.array([
+            [1, 0, 0],
+            [0, np.cos(rx), -np.sin(rx)],
+            [0, np.sin(rx), np.cos(rx)]
+        ])
+        
+        # Rotation around Y axis
+        Ry = np.array([
+            [np.cos(ry), 0, np.sin(ry)],
+            [0, 1, 0],
+            [-np.sin(ry), 0, np.cos(ry)]
+        ])
+        
+        # Rotation around Z axis
+        Rz = np.array([
+            [np.cos(rz), -np.sin(rz), 0],
+            [np.sin(rz), np.cos(rz), 0],
+            [0, 0, 1]
+        ])
+        
+        return Rz @ Ry @ Rx
+    
+    def draw_3d_cube(ax, rotation_matrix, color='cyan', alpha=0.6):
+        """Draw a rotated cube"""
+        # Define cube vertices
+        cube_size = 0.2
+        vertices = np.array([
+            [-cube_size, -cube_size, -cube_size],
+            [cube_size, -cube_size, -cube_size],
+            [cube_size, cube_size, -cube_size],
+            [-cube_size, cube_size, -cube_size],
+            [-cube_size, -cube_size, cube_size],
+            [cube_size, -cube_size, cube_size],
+            [cube_size, cube_size, cube_size],
+            [-cube_size, cube_size, cube_size]
+        ])
+        
+        # Apply rotation
+        rotated = vertices @ rotation_matrix.T
+        
+        # Draw cube edges
+        edges = [
+            [0, 1], [1, 2], [2, 3], [3, 0],  # Bottom face
+            [4, 5], [5, 6], [6, 7], [7, 4],  # Top face
+            [0, 4], [1, 5], [2, 6], [3, 7]   # Vertical edges
+        ]
+        
+        for edge in edges:
+            points = rotated[edge]
+            ax.plot3D(*points.T, 'b-', linewidth=2)
+        
+        # Draw center
+        ax.scatter(0, 0, 0, c='r', s=100, marker='o')
+    
+    def update_frame(frame):
+        # Limit trail length
+        start_idx = max(0, frame - TRAIL_LENGTH)
+        
+        # Update 3D trajectory
+        x_trail = accel_smooth["x"][start_idx:frame+1]
+        y_trail = accel_smooth["y"][start_idx:frame+1]
+        z_trail = accel_smooth["z"][start_idx:frame+1]
+        line_3d.set_data(x_trail, y_trail)
+        line_3d.set_3d_properties(z_trail)
+        
+        # Update current point
+        point_3d.set_data([accel_smooth["x"][frame]], [accel_smooth["y"][frame]])
+        point_3d.set_3d_properties([accel_smooth["z"][frame]])
+        
+        # Update 3D rotating cube
+        ax2.clear()
+        ax2.set_xlim([-0.5, 0.5])
+        ax2.set_ylim([-0.5, 0.5])
+        ax2.set_zlim([-0.5, 0.5])
+        ax2.set_xlabel('X')
+        ax2.set_ylabel('Y')
+        ax2.set_zlabel('Z')
+        ax2.set_title('3D Angular Motion - Rotating Cube')
+        
+        # Get rotation matrix from angular displacements
+        R = rotation_matrix_3d(angle_x[frame], angle_y[frame], angle_z[frame])
+        draw_3d_cube(ax2, R, color='cyan', alpha=0.6)
+        
+        # Update time-series
+        t_data = timestamps[0:frame+1]
+        line_x.set_data(t_data, accel_smooth["x"][0:frame+1])
+        line_y.set_data(t_data, accel_smooth["y"][0:frame+1])
+        line_z.set_data(t_data, accel_smooth["z"][0:frame+1])
+        
+        # Update gyro magnitude
+        line_gyro.set_data(t_data, gyro_magnitude[0:frame+1])
+        
+        # Update time display
+        time_text.set_text(f'Time: {timestamps[frame]:.2f}s / {max(timestamps):.2f}s')
+        
+        return line_3d, point_3d, line_x, line_y, line_z, line_gyro
+    
+    # Create animation
+    num_frames = len(timestamps)
+    ani = FuncAnimation(fig, update_frame, frames=num_frames, 
+                       interval=30, blit=False, repeat=True)
+    
+    plt.tight_layout(rect=[0, 0.03, 1, 1])
+    plt.show()
+
+
+def plot_3d_visualization(accel_smooth, gyro_smooth, timestamps):
+    """
+    Create 3D visualization of accelerometer motion with gyroscope as color intensity
+    """
+    fig = plt.figure(figsize=(12, 5))
+    
+    # 3D Accelerometer Trajectory
+    ax1 = fig.add_subplot(121, projection='3d')
+    ax1.set_xlim([-0.5, 0.5])
+    ax1.set_ylim([-0.5, 0.5])
+    ax1.set_zlim([-0.5, 0.5])
+    ax1.set_xlabel('X Acceleration (scaled)')
+    ax1.set_ylabel('Y Acceleration (scaled)')
+    ax1.set_zlabel('Z Acceleration (scaled)')
+    ax1.set_title('Paddle Motion (3D Accelerometer)')
+    
+    # Plot accelerometer trajectory
+    ax1.plot(accel_smooth["x"], accel_smooth["y"], accel_smooth["z"], 
+             'b-', linewidth=1, alpha=0.6, label='Trajectory')
+    ax1.scatter(accel_smooth["x"][0], accel_smooth["y"][0], accel_smooth["z"][0],
+                c='g', s=100, marker='o', label='Start')
+    ax1.scatter(accel_smooth["x"][-1], accel_smooth["y"][-1], accel_smooth["z"][-1],
+                c='r', s=100, marker='s', label='End')
+    ax1.legend()
+    
+    # 2D Time-Series Plot
+    ax2 = fig.add_subplot(122)
+    ax2.plot(timestamps, accel_smooth["x"], label='Ax', linewidth=1.5)
+    ax2.plot(timestamps, accel_smooth["y"], label='Ay', linewidth=1.5)
+    ax2.plot(timestamps, accel_smooth["z"], label='Az', linewidth=1.5)
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Acceleration (scaled)')
+    ax2.set_title('Accelerometer Data Over Time')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+
+def plot_angular_movement(gyro_smooth, timestamps):
+    """
+    Visualize angular movement as a rotating square with angular displacement
+    """
+    # Integrate gyroscope data to get angular displacement
+    dt = np.mean(np.diff(timestamps)) if len(timestamps) > 1 else 0.03
+    
+    # Cumulative angular displacement (integrate gyro data)
+    angle_x = np.cumsum(gyro_smooth["x"]) * dt
+    angle_y = np.cumsum(gyro_smooth["y"]) * dt
+    angle_z = np.cumsum(gyro_smooth["z"]) * dt
+    
+    # Create figure with multiple subplots
+    fig = plt.figure(figsize=(14, 10))
+    
+    # Plot 1: Angular displacement over time
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax1.plot(timestamps, angle_x, 'r-', linewidth=2, label='Roll (X)')
+    ax1.plot(timestamps, angle_y, 'g-', linewidth=2, label='Pitch (Y)')
+    ax1.plot(timestamps, angle_z, 'b-', linewidth=2, label='Yaw (Z)')
+    ax1.set_xlabel('Time (s)')
+    ax1.set_ylabel('Angular Displacement (rad)')
+    ax1.set_title('Angular Displacement Over Time')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # Plot 2: 2D representation of rotation (XY plane)
+    ax2 = fig.add_subplot(2, 2, 2)
+    
+    # Create rotating square visualization
+    square_size = 0.3
+    num_frames = min(len(timestamps), 50)  # Sample every nth frame
+    
+    for i in range(0, len(timestamps), max(1, len(timestamps) // num_frames)):
+        # Create square corners
+        corners = np.array([
+            [-square_size, -square_size],
+            [square_size, -square_size],
+            [square_size, square_size],
+            [-square_size, square_size],
+            [-square_size, -square_size]  # Close the square
+        ])
+        
+        # Apply rotation based on Z-axis (yaw)
+        theta = angle_z[i]
+        cos_t = np.cos(theta)
+        sin_t = np.sin(theta)
+        rotation_matrix = np.array([[cos_t, -sin_t], [sin_t, cos_t]])
+        rotated = corners @ rotation_matrix.T
+        
+        # Plot with color gradient
+        color_intensity = i / len(timestamps)
+        ax2.plot(rotated[:, 0], rotated[:, 1], color=plt.cm.viridis(color_intensity), alpha=0.6, linewidth=1)
+    
+    ax2.set_xlim([-0.5, 0.5])
+    ax2.set_ylim([-0.5, 0.5])
+    ax2.set_aspect('equal')
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    ax2.set_title('Angular Motion - XY Plane (Rotating Square)')
+    ax2.grid(True, alpha=0.3)
+    
+    # Plot 3: Angular velocity magnitude
+    ax3 = fig.add_subplot(2, 2, 3)
+    gyro_magnitude = np.sqrt(
+        gyro_smooth["x"]**2 + gyro_smooth["y"]**2 + gyro_smooth["z"]**2
+    )
+    ax3.plot(timestamps, gyro_magnitude, 'purple', linewidth=2)
+    ax3.fill_between(timestamps, gyro_magnitude, alpha=0.3, color='purple')
+    ax3.set_xlabel('Time (s)')
+    ax3.set_ylabel('Angular Velocity Magnitude (rad/s)')
+    ax3.set_title('Total Rotation Speed')
+    ax3.grid(True, alpha=0.3)
+    
+    # Plot 4: Final rotating square showing end state
+    ax4 = fig.add_subplot(2, 2, 4)
+    
+    # Draw square at final rotation angle
+    final_angle = angle_z[-1]
+    corners = np.array([
+        [-square_size, -square_size],
+        [square_size, -square_size],
+        [square_size, square_size],
+        [-square_size, square_size],
+        [-square_size, -square_size]
+    ])
+    
+    cos_f = np.cos(final_angle)
+    sin_f = np.sin(final_angle)
+    rotation_matrix = np.array([[cos_f, -sin_f], [sin_f, cos_f]])
+    rotated_final = corners @ rotation_matrix.T
+    
+    ax4.fill(rotated_final[:, 0], rotated_final[:, 1], color='cyan', alpha=0.5, edgecolor='blue', linewidth=2)
+    ax4.plot(rotated_final[:, 0], rotated_final[:, 1], 'b-', linewidth=2)
+    ax4.arrow(0, 0, square_size * 0.7 * cos_f, square_size * 0.7 * sin_f, 
+              head_width=0.05, head_length=0.05, fc='red', ec='red', linewidth=2)
+    
+    ax4.set_xlim([-0.5, 0.5])
+    ax4.set_ylim([-0.5, 0.5])
+    ax4.set_aspect('equal')
+    ax4.set_xlabel('X')
+    ax4.set_ylabel('Y')
+    ax4.set_title(f'Final Angular Position (Yaw: {np.degrees(final_angle):.1f}°)')
+    ax4.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+def plot_gyroscope_data(gyro_smooth, timestamps):
+    """Plot gyroscope rotation data"""
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8))
+    
+    axes[0].plot(timestamps, gyro_smooth["x"], 'r-', linewidth=1.5)
+    axes[0].set_ylabel('Gx (rad/s)')
+    axes[0].set_title('Gyroscope Data - X Rotation')
+    axes[0].grid(True, alpha=0.3)
+    
+    axes[1].plot(timestamps, gyro_smooth["y"], 'g-', linewidth=1.5)
+    axes[1].set_ylabel('Gy (rad/s)')
+    axes[1].set_title('Gyroscope Data - Y Rotation')
+    axes[1].grid(True, alpha=0.3)
+    
+    axes[2].plot(timestamps, gyro_smooth["z"], 'b-', linewidth=1.5)
+    axes[2].set_ylabel('Gz (rad/s)')
+    axes[2].set_xlabel('Time (s)')
+    axes[2].set_title('Gyroscope Data - Z Rotation')
+    axes[2].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.show()
+
+
+async def main():
+    print("=" * 50)
+    print("Arduino Nano IMU Data Recorder")
+    print("=" * 50)
+    
+    # Record data
+    imu_data = await connect_and_record_imu()
+    if imu_data is None:
+        print("[!] Failed to record data")
+        return
+    
+    accel_data = imu_data["accel"]
+    gyro_data = imu_data["gyro"]
+    timestamps = imu_data["timestamps"]
+    
+    # Save raw data
+    timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+    csv_filename = f"imu_recording_{timestamp_str}.csv"
+    save_data_to_csv(accel_data, gyro_data, timestamps, csv_filename)
+    
+    # Smooth data
+    print("[*] Smoothing data...")
+    accel_smooth = smooth_data(accel_data)
+    gyro_smooth = smooth_data(gyro_data)
+    
+    # Plot visualizations
+    print("[*] Generating animated visualization...")
+    animate_all_data(accel_smooth, gyro_smooth, timestamps)
+    
+    print("[✓] Done!")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
