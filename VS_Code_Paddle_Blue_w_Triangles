@@ -1,0 +1,107 @@
+import os
+import sys
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QFileDialog, QMessageBox, QAction
+)
+
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+
+class STLViewer(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("STL 3D Viewer (Spin with Mouse)")
+        self.resize(1100, 800)
+
+        # 3D viewport widget
+        self.plotter = QtInteractor(self)
+        self.setCentralWidget(self.plotter.interactor)
+
+        # Basic scene setup
+        self.plotter.set_background("black")
+        self.mesh_actor = None
+
+        # Menu
+        self._build_menu()
+
+        # Try auto-load a local file if present
+        default_file = "paddle.stl"
+        if os.path.exists(default_file):
+            self.load_stl(default_file)
+
+    def _build_menu(self):
+        menubar = self.menuBar()
+
+        file_menu = menubar.addMenu("&File")
+
+        open_action = QAction("&Open STL...", self)
+        open_action.setShortcut("Ctrl+O")
+        open_action.triggered.connect(self.open_file_dialog)
+        file_menu.addAction(open_action)
+
+        reset_action = QAction("&Reset View", self)
+        reset_action.setShortcut("R")
+        reset_action.triggered.connect(self.reset_view)
+        file_menu.addAction(reset_action)
+
+        file_menu.addSeparator()
+
+        exit_action = QAction("E&xit", self)
+        exit_action.setShortcut("Ctrl+Q")
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+
+    def open_file_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open STL File",
+            "",
+            "STL Files (*.stl);;All Files (*.*)"
+        )
+        if path:
+            self.load_stl(path)
+
+    def load_stl(self, path: str):
+        try:
+            mesh = pv.read(path)
+
+            # Clear old mesh
+            self.plotter.clear()
+
+            # Show axes + mesh
+            self.plotter.add_axes()
+            self.plotter.add_mesh(
+                mesh,
+                show_edges=True,
+                smooth_shading=True
+            )
+
+            # Nice camera framing
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
+
+            self.statusBar().showMessage(f"Loaded: {path}")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Failed to load STL",
+                f"Could not load:\n{path}\n\nError:\n{e}"
+            )
+
+    def reset_view(self):
+        self.plotter.reset_camera()
+        self.plotter.view_isometric()
+
+
+def main():
+    app = QApplication(sys.argv)
+    win = STLViewer()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
