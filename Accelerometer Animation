@@ -1,0 +1,212 @@
+import os
+import asyncio
+import time
+import numpy as np
+import pyvista as pv
+import imageio
+from bleak import BleakScanner, BleakClient
+from scipy.signal import savgol_filter
+
+# ---------------- CONFIG ----------------
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+RECORD_TIME = 10  # seconds
+SAMPLE_RATE = 50  # Hz (higher sampling for smoother data)
+ANIMATION_FPS = 30  # Higher FPS for smoother playback
+INTERPOLATION_FACTOR = 4  # Interpolate between data points for ultra-smooth motion
+
+STL_FILE = r"C:\Users\Brooke\Downloads\VS Code\Captone Spring\paddle.stl"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_accel_animation.mp4")
+# ---------------------------------------
+
+
+# ---------------------------------------------------
+# RECORD ACCELEROMETER DATA
+# ---------------------------------------------------
+async def record_ble_accel():
+
+    print("[*] Scanning for BLE device...")
+    devices = await BleakScanner.discover()
+    dev = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+    if not dev:
+        print("[!] Device not found")
+        return None, None, None, None
+
+    print("[✓] Found:", dev.address)
+
+    ax, ay, az, ts = [], [], [], []
+
+    async with BleakClient(dev.address) as client:
+        print("[✓] Connected")
+        print(f"[*] Recording for {RECORD_TIME} seconds...")
+
+        start = time.time()
+        next_sample_time = start
+        sample_interval = 1.0 / SAMPLE_RATE
+
+        while time.time() - start < RECORD_TIME:
+            current_time = time.time()
+
+            # Wait until next sample time for consistent sampling
+            if current_time < next_sample_time:
+                await asyncio.sleep(next_sample_time - current_time)
+
+            data = await client.read_gatt_char(CHAR_UUID)
+            values = data.decode().strip().split(",")
+
+            if len(values) >= 3:
+                ax.append(float(values[0]))
+                ay.append(float(values[1]))
+                az.append(float(values[2]))
+                ts.append(current_time - start)
+
+            next_sample_time += sample_interval
+
+    print("[✓] Recording complete")
+    print("Samples collected:", len(ts))
+
+    return np.array(ax), np.array(ay), np.array(az), np.array(ts)
+
+
+# ---------------------------------------------------
+# CLEAN / SMOOTH DATA
+# ---------------------------------------------------
+def preprocess_accel(ax, ay, az):
+
+    print("[*] Applying advanced filtering and smoothing...")
+
+    # Apply Savitzky-Golay filter with adaptive window size
+    window_length = min(21, len(ax) // 2 * 2 + 1)  # Larger window for smoother filtering
+    if window_length >= 5:
+        ax = savgol_filter(ax, window_length, 3)
+        ay = savgol_filter(ay, window_length, 3)
+        az = savgol_filter(az, window_length, 3)
+
+    # Apply additional low-pass filtering for extra smoothness
+    from scipy.signal import butter, filtfilt
+    try:
+        # 2nd order Butterworth low-pass filter at 5Hz cutoff
+        nyquist = SAMPLE_RATE / 2
+        cutoff = min(5.0, nyquist * 0.8)  # 5Hz cutoff or 80% of Nyquist
+        b, a = butter(2, cutoff / nyquist, btype='low')
+        ax = filtfilt(b, a, ax)
+        ay = filtfilt(b, a, ay)
+        az = filtfilt(b, a, az)
+        print(f"[✓] Applied Butterworth low-pass filter (cutoff: {cutoff}Hz)")
+    except Exception as e:
+        print(f"[!] Butterworth filter failed: {e}, using Savitzky-Golay only")
+
+    return ax, ay, az
+
+
+# ---------------------------------------------------
+# ANIMATE STL USING GRAVITY VECTOR (SMOOTH INTERPOLATION)
+# ---------------------------------------------------
+def animate_paddle_from_accel(ax, ay, az, ts):
+
+    print("[*] Creating ultra-smooth interpolated animation...")
+
+    # Create cubic spline interpolation for ultra-smooth motion
+    from scipy.interpolate import CubicSpline
+
+    # Create interpolation functions
+    cs_ax = CubicSpline(ts, ax, bc_type='natural')
+    cs_ay = CubicSpline(ts, ay, bc_type='natural')
+    cs_az = CubicSpline(ts, az, bc_type='natural')
+
+    plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
+    mesh = pv.read(STL_FILE)
+    mesh.translate(-np.array(mesh.center))
+
+    actor = plotter.add_mesh(mesh, color="green")
+    plotter.add_axes()
+    plotter.set_background("white")
+    plotter.show(auto_close=False)
+
+    # Create video writer with better codec
+    try:
+        writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS, codec='libx264', pixelformat='yuv420p')
+        print(f"[✓] Using H.264 codec at {ANIMATION_FPS} FPS")
+    except Exception as e:
+        print(f"[!] H.264 codec failed: {e}, using default")
+        writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
+
+    # Calculate animation parameters
+    duration = ts[-1]
+    frame_interval = 1.0 / ANIMATION_FPS
+    total_frames = int(duration * ANIMATION_FPS)
+
+    print(f"[*] Rendering {total_frames} frames at {ANIMATION_FPS} FPS (duration: {duration:.1f}s)")
+
+    for frame_idx in range(total_frames):
+        # Calculate current time in animation
+        current_time = frame_idx * frame_interval
+
+        # Ensure we don't exceed data range
+        current_time = min(current_time, ts[-1])
+
+        # Get interpolated values for ultra-smooth motion
+        ax_val = float(cs_ax(current_time))
+        ay_val = float(cs_ay(current_time))
+        az_val = float(cs_az(current_time))
+
+        # Normalize gravity vector
+        g = np.sqrt(ax_val**2 + ay_val**2 + az_val**2)
+        if g > 0:
+            axn = ax_val / g
+            ayn = ay_val / g
+            azn = az_val / g
+
+            # Compute roll and pitch (degrees)
+            roll = np.degrees(np.arctan2(ayn, azn))
+            pitch = np.degrees(np.arctan2(-axn, np.sqrt(ayn**2 + azn**2)))
+
+            # Reset orientation and apply smooth rotation
+            actor.SetOrientation(0, 0, 0)
+            actor.rotate_x(pitch)
+            actor.rotate_y(roll)
+
+        # Add time indicator
+        plotter.add_text(
+            f"t = {current_time:.2f} s",
+            position="upper_left",
+            font_size=12,
+            name="time"
+        )
+
+        plotter.render()
+        frame = plotter.screenshot(return_img=True)
+        writer.append_data(frame)
+
+        # Progress indicator
+        if frame_idx % 50 == 0:
+            progress = (frame_idx / total_frames) * 100
+            print(f"[*] Rendering progress: {progress:.1f}% ({frame_idx}/{total_frames})")
+
+    writer.close()
+    plotter.close()
+
+    print(f"[✓] Ultra-smooth animation saved to: {VIDEO_OUT}")
+    print(f"[✓] Animation specs: {ANIMATION_FPS} FPS, {total_frames} frames, {duration:.1f}s duration")
+
+
+# ---------------------------------------------------
+# MAIN
+# ---------------------------------------------------
+def main():
+
+    ax, ay, az, ts = asyncio.run(record_ble_accel())
+
+    if ax is None:
+        return
+
+    ax, ay, az = preprocess_accel(ax, ay, az)
+
+    animate_paddle_from_accel(ax, ay, az, ts)
+
+
+if __name__ == "__main__":
+    main()
