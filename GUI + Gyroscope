@@ -6,15 +6,16 @@ import numpy as np
 import time
 import csv
 import imageio
+import cv2
 from scipy.signal import savgol_filter, butter, filtfilt
 from scipy.interpolate import CubicSpline
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
-    QVBoxLayout, QHBoxLayout, QStackedWidget, QMessageBox
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QMessageBox, QListWidget, QListWidgetItem, QSlider
 )
-from PyQt5.QtGui import QPixmap, QFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtGui import QPixmap, QFont, QImage
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl, QTimer
 from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
 from PyQt5.QtMultimediaWidgets import QVideoWidget
 
@@ -291,31 +292,73 @@ class PaddleViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Main horizontal layout for side-by-side panels
+        main_h = QHBoxLayout(self)
+        
+        # Left panel: Video file list
+        left_panel = QVBoxLayout()
+        
+        file_label = QLabel("Video Files:")
+        file_label.setFont(QFont("Arial", 10, QFont.Bold))
+        left_panel.addWidget(file_label)
+        
+        # List of video files
+        self.video_list = QListWidget()
+        self.video_list.itemDoubleClicked.connect(self.play_selected_video)
+        left_panel.addWidget(self.video_list)
+        
+        # Store video windows to keep them alive
+        self.video_windows = []
+        
+        # Buttons for file operations
+        file_btn_layout = QHBoxLayout()
+        
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self.refresh_video_list)
+        file_btn_layout.addWidget(refresh_btn)
+        
+        play_btn = QPushButton("Play")
+        play_btn.clicked.connect(self.play_selected_video)
+        file_btn_layout.addWidget(play_btn)
+        
+        left_panel.addLayout(file_btn_layout)
+        
+        # Create container widget for left panel
+        left_container = QWidget()
+        left_container.setLayout(left_panel)
+        left_container.setMaximumWidth(250)
+        main_h.addWidget(left_container)
+        
+        # Right panel: 3D viewer and controls
+        right_panel = QVBoxLayout()
+        
         self.plotter = QtInteractor(self)
-
-        main = QVBoxLayout(self)
-        main.addWidget(self.plotter.interactor)
+        right_panel.addWidget(self.plotter.interactor)
 
         bar = QHBoxLayout()
 
         # Recording and animation buttons
         self.record_btn = QPushButton("Record Gyro Data")
         self.animate_btn = QPushButton("Create Animation from Data")
-        self.browse_videos_btn = QPushButton("Browse Videos")
         self.back_btn = QPushButton("Back")
 
         bar.addWidget(self.record_btn)
         bar.addWidget(self.animate_btn)
-        bar.addWidget(self.browse_videos_btn)
         bar.addStretch()
         bar.addWidget(self.back_btn)
 
-        bar.addStretch()
-        main.addLayout(bar)
+        right_panel.addLayout(bar)
+        
+        # Create container widget for right panel
+        right_container = QWidget()
+        right_container.setLayout(right_panel)
+        main_h.addWidget(right_container, 1)
 
         self.record_btn.clicked.connect(self.start_recording)
         self.animate_btn.clicked.connect(self.start_animation)
-        self.browse_videos_btn.clicked.connect(self.browse_and_play_video)
+        
+        # Load initial video list
+        self.refresh_video_list()
 
     def load_default(self):
 
@@ -420,51 +463,159 @@ class PaddleViewer(QWidget):
         if file_path:
             self.play_video_window(file_path)
 
-    def play_video_window(self, video_path):
-        """Display video in a separate window"""
+    def refresh_video_list(self):
+        """Scan folder for MP4 files and populate list"""
+        self.video_list.clear()
+        
+        print(f"[*] Scanning for videos in: {SCRIPT_DIR}")
+        
+        # Get all MP4 files in script directory
+        video_files = []
+        try:
+            for file in os.listdir(SCRIPT_DIR):
+                if file.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv')):
+                    video_files.append(file)
+                    print(f"[*] Found video: {file}")
+        except Exception as e:
+            print(f"[!] Error scanning directory: {e}")
+        
+        # Sort by name
+        video_files.sort()
+        
+        print(f"[*] Total videos found: {len(video_files)}")
+        
+        # Add to list widget
+        for video_file in video_files:
+            item = QListWidgetItem(video_file)
+            item.setData(Qt.UserRole, os.path.join(SCRIPT_DIR, video_file))
+            self.video_list.addItem(item)
+        
+        if video_files:
+            self.video_list.setCurrentRow(0)
+
+    def play_selected_video(self):
+        """Play the selected video from the list"""
+        print("[*] Play button clicked")
+        current_item = self.video_list.currentItem()
+        if not current_item:
+            print("[!] No video selected")
+            QMessageBox.warning(self, "No Selection", "Please select a video to play.")
+            return
+        
+        video_path = current_item.data(Qt.UserRole)
+        print(f"[*] Playing: {video_path}")
+        self.play_video_opencv(video_path)
+
+    def play_video_opencv(self, video_path):
+        """Play video using OpenCV"""
+        print(f"[*] Opening video: {video_path}")
+        
         if not os.path.exists(video_path):
+            print(f"[!] File not found: {video_path}")
             QMessageBox.warning(self, "File Not Found", f"Video file not found:\n{video_path}")
             return
         
-        # Create new window for video
+        # Create video window
         video_window = QWidget()
         video_window.setWindowTitle(f"Video Player - {os.path.basename(video_path)}")
         video_window.resize(960, 720)
         
         layout = QVBoxLayout(video_window)
-        layout.setContentsMargins(0, 0, 0, 0)
         
-        # Create video player
-        media_player = QMediaPlayer()
-        video_widget = QVideoWidget()
-        media_player.setVideoOutput(video_widget)
+        # Video display label
+        video_label = QLabel()
+        video_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(video_label)
         
-        # Load and play video
-        media_player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
-        media_player.play()
-        
-        layout.addWidget(video_widget)
-        
-        # Add control buttons
+        # Control buttons
         control_layout = QHBoxLayout()
         
-        def toggle_play():
-            if media_player.state() == QMediaPlayer.PlayingState:
-                media_player.pause()
-                play_btn.setText("Play")
-            else:
-                media_player.play()
-                play_btn.setText("Pause")
-        
-        play_btn = QPushButton("Pause")
-        play_btn.clicked.connect(toggle_play)
-        control_layout.addWidget(play_btn)
-        
+        play_btn = QPushButton("Play")
         stop_btn = QPushButton("Stop")
-        stop_btn.clicked.connect(media_player.stop)
-        control_layout.addWidget(stop_btn)
+        fullscreen_btn = QPushButton("Full Screen")
         
-        # Full screen button
+        control_layout.addWidget(play_btn)
+        control_layout.addWidget(stop_btn)
+        control_layout.addWidget(fullscreen_btn)
+        control_layout.addStretch()
+        
+        layout.addLayout(control_layout)
+        
+        # Video player state
+        class VideoPlayer:
+            def __init__(self):
+                self.cap = cv2.VideoCapture(video_path)
+                if not self.cap.isOpened():
+                    raise Exception(f"Cannot open video: {video_path}")
+                
+                self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+                self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.frame_delay = int(1000 / self.fps) if self.fps > 0 else 33
+                self.is_playing = False
+                self.current_frame = 0
+                self.timer = QTimer()
+                
+                print(f"[*] Video loaded: {self.total_frames} frames @ {self.fps} FPS")
+        
+        try:
+            player = VideoPlayer()
+        except Exception as e:
+            print(f"[!] Error opening video: {e}")
+            QMessageBox.critical(self, "Video Error", f"Cannot open video:\n{str(e)}")
+            return
+        
+        def show_frame(frame_num):
+            player.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = player.cap.read()
+            
+            if not ret:
+                print(f"[!] Cannot read frame {frame_num}")
+                return
+            
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
+            
+            # Convert to QImage
+            bytes_per_line = 3 * w
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Scale to fit label
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaledToWidth(video_label.width() - 20, Qt.SmoothTransformation)
+            video_label.setPixmap(scaled_pixmap)
+            
+            player.current_frame = frame_num
+        
+        def play_video():
+            if not player.is_playing:
+                player.is_playing = True
+                play_btn.setText("Pause")
+                player.timer.start(player.frame_delay)
+        
+        def pause_video():
+            if player.is_playing:
+                player.is_playing = False
+                play_btn.setText("Play")
+                player.timer.stop()
+        
+        def toggle_play():
+            if player.is_playing:
+                pause_video()
+            else:
+                play_video()
+        
+        def stop_video():
+            pause_video()
+            player.current_frame = 0
+            show_frame(0)
+            player.timer.stop()
+        
+        def next_frame():
+            if player.current_frame < player.total_frames - 1:
+                player.current_frame += 1
+                show_frame(player.current_frame)
+        
         def toggle_fullscreen():
             if video_window.isFullScreen():
                 video_window.showNormal()
@@ -473,15 +624,29 @@ class PaddleViewer(QWidget):
                 video_window.showFullScreen()
                 fullscreen_btn.setText("Exit Full Screen")
         
-        fullscreen_btn = QPushButton("Full Screen")
+        # Connect buttons
+        play_btn.clicked.connect(toggle_play)
+        stop_btn.clicked.connect(stop_video)
         fullscreen_btn.clicked.connect(toggle_fullscreen)
-        control_layout.addWidget(fullscreen_btn)
         
-        control_layout.addStretch()
+        # Timer for video playback
+        player.timer.timeout.connect(next_frame)
         
-        layout.addLayout(control_layout)
+        # Cleanup when window closes
+        def cleanup():
+            player.timer.stop()
+            player.cap.release()
+            if video_window in self.video_windows:
+                self.video_windows.remove(video_window)
+            print(f"[*] Video window closed")
         
+        video_window.destroyed.connect(cleanup)
+        self.video_windows.append(video_window)
+        
+        # Show first frame and window
+        show_frame(0)
         video_window.show()
+        print(f"[*] Video window opened")
 
 
 class NexshotMain(QMainWindow):
