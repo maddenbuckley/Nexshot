@@ -1,80 +1,126 @@
+import os
+import asyncio
+from bleak import BleakScanner, BleakClient
 import numpy as np
 import pyvista as pv
-from datetime import datetime
+import imageio
 import time
-import imageio.v2 as imageio
+from scipy.signal import savgol_filter
 
+# ---------------- CONFIG ----------------
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+RECORD_TIME = 10  # seconds
 STL_FILE = r"C:\Users\Brooke\Downloads\VS Code\Captone Spring\paddle.stl"
-OUT_VIDEO = "paddle_animation.mp4"
 
-# ----------------------------------------
-# Example: replace these with your real data
-# ----------------------------------------
-def load_gyro_data():
-    # Replace with your CSV loader
-    gx = np.array([52.6, 52.0, 53.1, 54.5, 54.8, 52.9, 45.5, 32.7, 14.2, -9.0])
-    gy = np.array([-1.2, -1.3, -1.6, -1.9, -1.9, -1.3, 0.8, 4.4, 9.3, 15.1])
-    gz = np.array([8.1, 8.1, 7.8, 7.5, 7.5, 8.1, 10.1, 13.2, 17.6, 22.7])
-    ts = np.linspace(0, 10, len(gx))  # 10 seconds total
-    return gx, gy, gz, ts
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_animation.mp4")
 
-# ----------------------------------------
-# Simple low-pass smoothing
-# ----------------------------------------
-def smooth(x, alpha=0.2):
-    y = np.zeros_like(x)
-    y[0] = x[0]
-    for i in range(1, len(x)):
-        y[i] = alpha * x[i] + (1 - alpha) * y[i - 1]
-    return y
+#VIDEO_OUT = "paddle_ble_animation.mp4"
+FPS = 7  # playback speed
+# --------------------------------------
 
-# ----------------------------------------
-# Animation Export
-# ----------------------------------------
-def animate_paddle(gx, gy, gz, ts):
-    plotter = pv.Plotter(off_screen=True, window_size=(912, 704))
+
+async def record_ble_gyro():
+    print("[*] Scanning for BLE...")
+    devices = await BleakScanner.discover()
+    dev = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+    if not dev:
+        print("[!] BLE device not found")
+        return None, None, None, None
+
+    print("[✓] Found device:", dev.address)
+
+    gx, gy, gz, ts = [], [], [], []
+
+    async with BleakClient(dev.address) as client:
+        print(f"[✓] Connected to {DEVICE_NAME}")
+        print(f"[*] Recording for {RECORD_TIME} seconds...")
+        start = time.time()
+
+        while time.time() - start < RECORD_TIME:
+            data = await client.read_gatt_char(CHAR_UUID)
+            vals = data.decode().strip().split(",")
+
+            if len(vals) >= 6:
+                gx.append(float(vals[3]))
+                gy.append(float(vals[4]))
+                gz.append(float(vals[5]))
+                ts.append(time.time() - start)
+
+            await asyncio.sleep(0.03)
+
+    print("[✓] Recording finished")
+    print("Samples:", len(ts), "Duration:", ts[-1])
+
+    return np.array(gx), np.array(gy), np.array(gz), np.array(ts)
+
+
+def preprocess_gyro(gx, gy, gz):
+    print("[*] Cleaning up data...")
+
+    # smooth
+    gx = savgol_filter(gx, 11, 3)
+    gy = savgol_filter(gy, 11, 3)
+    gz = savgol_filter(gz, 11, 3)
+
+    # bias removal (first second)
+    n_bias = min(30, len(gx))
+    bx, by, bz = np.mean(gx[:n_bias]), np.mean(gy[:n_bias]), np.mean(gz[:n_bias])
+    gx -= bx
+    gy -= by
+    gz -= bz
+
+    print(f"Bias removed: bx={bx:.3f}, by={by:.3f}, bz={bz:.3f}")
+    return gx, gy, gz
+
+
+def animate_paddle_offscreen(gx, gy, gz, ts):
+    print("[*] Completing animation offscreen...")
+
+    plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
+
     mesh = pv.read(STL_FILE)
-    mesh.translate(-np.array(mesh.center), inplace=True)
+    mesh.translate(-np.array(mesh.center))  # rotate around center
 
-    actor = plotter.add_mesh(mesh, color="lightblue", smooth_shading=True)
+    actor = plotter.add_mesh(mesh, color="green")
+    plotter.add_axes()
     plotter.set_background("white")
-    plotter.camera_position = "iso"
+    plotter.show(auto_close=False)
 
-    writer = imageio.get_writer(OUT_VIDEO, fps=30)
-
-    angles = np.array([0.0, 0.0, 0.0])  # roll, pitch, yaw in degrees
+    writer = imageio.get_writer(VIDEO_OUT, fps=FPS)
 
     for i in range(1, len(ts)):
         dt = ts[i] - ts[i - 1]
 
-        angles[0] += gx[i] * dt
-        angles[1] += gy[i] * dt
-        angles[2] += gz[i] * dt
+        rx = gx[i] * np.pi / 180.0 * dt
+        ry = gy[i] * np.pi / 180.0 * dt
+        rz = gz[i] * np.pi / 180.0 * dt
 
-        mesh.points = mesh.copy().points
-        mesh.rotate_x(angles[0], inplace=True)
-        mesh.rotate_y(angles[1], inplace=True)
-        mesh.rotate_z(angles[2], inplace=True)
+        actor.rotate_x(np.degrees(rx))
+        actor.rotate_y(np.degrees(ry))
+        actor.rotate_z(np.degrees(rz))
 
         plotter.render()
+        plotter.add_text(f"t = {ts[i]:.2f} s", position="upper_left", font_size=12, name="time")
         frame = plotter.screenshot(return_img=True)
         writer.append_data(frame)
 
     writer.close()
     plotter.close()
-    print(f"[✓] Animation exported: {OUT_VIDEO}")
 
-# ----------------------------------------
-# Main
-# ----------------------------------------
+    print(f"[✓] Exported animation: {VIDEO_OUT}")
+
+
 def main():
-    gx, gy, gz, ts = load_gyro_data()
+    gx, gy, gz, ts = asyncio.run(record_ble_gyro())
+    if gx is None:
+        return
 
-    gx = smooth(gx)
-    gy = smooth(gy)
-    gz = smooth(gz)
+    gx, gy, gz = preprocess_gyro(gx, gy, gz)
+    animate_paddle_offscreen(gx, gy, gz, ts)
 
-    animate_paddle(gx, gy, gz, ts)
 
 if __name__ == "__main__":
     main()
