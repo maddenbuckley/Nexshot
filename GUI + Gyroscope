@@ -1,0 +1,504 @@
+import os
+import sys
+import asyncio
+import threading
+import numpy as np
+import time
+import csv
+import imageio
+from scipy.signal import savgol_filter, butter, filtfilt
+from scipy.interpolate import CubicSpline
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QMessageBox
+)
+from PyQt5.QtGui import QPixmap, QFont
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+from bleak import BleakScanner, BleakClient
+
+# ---------------------------------------------------
+# WORKER THREADS
+# ---------------------------------------------------
+class GyroRecordingWorker(QThread):
+    """Worker thread to record gyroscope data"""
+    progress = pyqtSignal(str)  # Status messages
+    finished = pyqtSignal(int)  # Number of samples recorded
+    error = pyqtSignal(str)  # Error message
+
+    def run(self):
+        """Record gyro data asynchronously"""
+        try:
+            self.progress.emit("[*] Scanning for BLE device...")
+            
+            # Run async recording
+            try:
+                asyncio.run(self._async_record())
+            except RuntimeError:
+                # Handle event loop issues
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._async_record())
+                loop.close()
+
+        except Exception as e:
+            self.progress.emit(f"[!] Recording error: {e}")
+            import traceback
+            self.progress.emit(traceback.format_exc())
+            self.error.emit(str(e))
+
+    async def _async_record(self):
+        """Async recording implementation"""
+        devices = await BleakScanner.discover()
+        dev = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+        if not dev:
+            self.progress.emit("[!] Device not found")
+            self.error.emit(f"Device '{DEVICE_NAME}' not found")
+            return
+
+        self.progress.emit(f"[✓] Found device: {dev.address}")
+        self.progress.emit(f"[*] Recording for {RECORD_TIME} seconds...")
+
+        gx_data, gy_data, gz_data, ts_data = [], [], [], []
+
+        async with BleakClient(dev.address) as client:
+            self.progress.emit("[✓] Connected")
+
+            start = time.time()
+            next_sample_time = start
+            sample_interval = 1.0 / SAMPLE_RATE
+
+            while time.time() - start < RECORD_TIME:
+                current_time = time.time()
+
+                if current_time < next_sample_time:
+                    await asyncio.sleep(next_sample_time - current_time)
+
+                try:
+                    data = await client.read_gatt_char(CHAR_UUID)
+                    vals = data.decode().strip().split(",")
+
+                    if len(vals) >= 6:
+                        gx_data.append(float(vals[3]))
+                        gy_data.append(float(vals[4]))
+                        gz_data.append(float(vals[5]))
+                        ts_data.append(current_time - start)
+                except Exception as e:
+                    self.progress.emit(f"[!] Read error: {e}")
+
+                next_sample_time += sample_interval
+
+        self.progress.emit(f"[✓] Recording complete: {len(ts_data)} samples")
+
+        # Save to CSV
+        self._save_gyro_data(ts_data, gx_data, gy_data, gz_data)
+        self.finished.emit(len(ts_data))
+
+    def _save_gyro_data(self, ts, gx, gy, gz):
+        """Save gyro data to CSV"""
+        try:
+            with open(GYRO_DATA_FILE, 'w', newline='') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(['timestamp', 'gx', 'gy', 'gz'])
+                for i in range(len(ts)):
+                    writer.writerow([ts[i], gx[i], gy[i], gz[i]])
+            self.progress.emit(f"[✓] Data saved to {GYRO_DATA_FILE}")
+        except Exception as e:
+            self.progress.emit(f"[!] Save error: {e}")
+            self.error.emit(f"Failed to save data: {e}")
+
+
+class GyroAnimationWorker(QThread):
+    """Worker thread to create animation from gyro data"""
+    progress = pyqtSignal(str)  # Status messages
+    finished = pyqtSignal(str)  # Video file path
+    error = pyqtSignal(str)  # Error message
+
+    def run(self):
+        """Create animation from saved gyro data"""
+        try:
+            if not os.path.exists(GYRO_DATA_FILE):
+                self.error.emit("No gyro data found. Record data first.")
+                return
+
+            self.progress.emit("[*] Loading gyro data...")
+            ts, gx, gy, gz = self._load_gyro_data()
+
+            if ts is None:
+                self.error.emit("Failed to load gyro data")
+                return
+
+            self.progress.emit(f"[✓] Loaded {len(ts)} samples")
+
+            # Process data
+            gx, gy, gz = self._process_gyro_data(gx, gy, gz)
+
+            # Create animation
+            self._animate_from_gyro(gx, gy, gz, ts)
+
+            self.progress.emit("[✓] Animation complete!")
+            self.finished.emit(VIDEO_OUT)
+
+        except Exception as e:
+            self.progress.emit(f"[!] Animation error: {e}")
+            import traceback
+            self.progress.emit(traceback.format_exc())
+            self.error.emit(str(e))
+
+    def _load_gyro_data(self):
+        """Load gyro data from CSV"""
+        ts, gx, gy, gz = [], [], [], []
+
+        try:
+            with open(GYRO_DATA_FILE, 'r') as csvfile:
+                reader = csv.reader(csvfile)
+                next(reader)  # Skip header
+                for row in reader:
+                    if len(row) >= 4:
+                        ts.append(float(row[0]))
+                        gx.append(float(row[1]))
+                        gy.append(float(row[2]))
+                        gz.append(float(row[3]))
+            return np.array(ts), np.array(gx), np.array(gy), np.array(gz)
+        except Exception as e:
+            self.progress.emit(f"[!] Load error: {e}")
+            return None, None, None, None
+
+    def _process_gyro_data(self, gx, gy, gz):
+        """Apply filtering to gyro data"""
+        self.progress.emit("[*] Processing gyro data...")
+
+        # Savitzky-Golay filter
+        window_length = min(21, len(gx) // 2 * 2 + 1)
+        if window_length >= 5:
+            gx = savgol_filter(gx, window_length, 3)
+            gy = savgol_filter(gy, window_length, 3)
+            gz = savgol_filter(gz, window_length, 3)
+
+        # Butterworth low-pass filter
+        try:
+            nyquist = SAMPLE_RATE / 2
+            cutoff = min(5.0, nyquist * 0.8)
+            b, a = butter(2, cutoff / nyquist, btype='low')
+            gx = filtfilt(b, a, gx)
+            gy = filtfilt(b, a, gy)
+            gz = filtfilt(b, a, gz)
+            self.progress.emit(f"[✓] Applied Butterworth filter (cutoff: {cutoff}Hz)")
+        except Exception as e:
+            self.progress.emit(f"[!] Filter failed: {e}")
+
+        # Bias removal
+        n_bias = min(30, len(gx))
+        bx = np.mean(gx[:n_bias])
+        by = np.mean(gy[:n_bias])
+        bz = np.mean(gz[:n_bias])
+        gx -= bx
+        gy -= by
+        gz -= bz
+        self.progress.emit(f"[✓] Bias removed: bx={bx:.3f}, by={by:.3f}, bz={bz:.3f}")
+
+        return gx, gy, gz
+
+    def _animate_from_gyro(self, gx, gy, gz, ts):
+        """Create animation from gyro data"""
+        self.progress.emit("[*] Creating animation...")
+
+        # Cubic spline interpolation
+        cs_gx = CubicSpline(ts, gx, bc_type='natural')
+        cs_gy = CubicSpline(ts, gy, bc_type='natural')
+        cs_gz = CubicSpline(ts, gz, bc_type='natural')
+
+        plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
+        mesh = pv.read(STL_FILE)
+        mesh.translate(-np.array(mesh.center))
+
+        actor = plotter.add_mesh(mesh, color="green")
+        plotter.add_axes()
+        plotter.set_background("white")
+        plotter.show(auto_close=False)
+
+        # Video writer
+        try:
+            writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS, codec='libx264', pixelformat='yuv420p')
+            self.progress.emit(f"[✓] Using H.264 codec at {ANIMATION_FPS} FPS")
+        except Exception as e:
+            self.progress.emit(f"[!] H.264 failed: {e}, using default")
+            writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
+
+        # Render animation
+        duration = ts[-1]
+        frame_interval = 1.0 / ANIMATION_FPS
+        total_frames = int(duration * ANIMATION_FPS)
+
+        self.progress.emit(f"[*] Rendering {total_frames} frames...")
+
+        for frame_idx in range(total_frames):
+            current_time = frame_idx * frame_interval
+            current_time = min(current_time, ts[-1])
+
+            gx_val = float(cs_gx(current_time))
+            gy_val = float(cs_gy(current_time))
+            gz_val = float(cs_gz(current_time))
+
+            if frame_idx < total_frames - 1:
+                next_time = min((frame_idx + 1) * frame_interval, ts[-1])
+                dt = next_time - current_time
+            else:
+                dt = frame_interval
+
+            rx = gx_val * np.pi / 180.0 * dt
+            ry = gy_val * np.pi / 180.0 * dt
+            rz = gz_val * np.pi / 180.0 * dt
+
+            actor.rotate_x(np.degrees(rx))
+            actor.rotate_y(np.degrees(ry))
+            actor.rotate_z(np.degrees(rz))
+
+            plotter.add_text(f"t = {current_time:.2f} s", position="upper_left", font_size=12, name="time")
+
+            plotter.render()
+            frame = plotter.screenshot(return_img=True)
+            writer.append_data(frame)
+
+            if frame_idx % 50 == 0:
+                progress = (frame_idx / total_frames) * 100
+                self.progress.emit(f"[*] Progress: {progress:.1f}%")
+
+        writer.close()
+        plotter.close()
+
+        self.progress.emit(f"[✓] Video saved to {VIDEO_OUT}")
+# Config
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+RECORD_TIME = 10  # seconds
+SAMPLE_RATE = 50  # Hz
+ANIMATION_FPS = 30
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STL_FILE = os.path.join(SCRIPT_DIR, "paddle.stl")
+GYRO_DATA_FILE = os.path.join(SCRIPT_DIR, "gyro_data.csv")
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_gyro_video.mp4")
+
+
+class PaddleViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.plotter = QtInteractor(self)
+
+        main = QVBoxLayout(self)
+        main.addWidget(self.plotter.interactor)
+
+        bar = QHBoxLayout()
+
+        # Recording and animation buttons
+        self.record_btn = QPushButton("Record Gyro Data")
+        self.animate_btn = QPushButton("Create Animation from Data")
+        self.back_btn = QPushButton("Back")
+
+        bar.addWidget(self.record_btn)
+        bar.addWidget(self.animate_btn)
+        bar.addStretch()
+        bar.addWidget(self.back_btn)
+
+        bar.addStretch()
+        main.addLayout(bar)
+
+        self.record_btn.clicked.connect(self.start_recording)
+        self.animate_btn.clicked.connect(self.start_animation)
+
+    def load_default(self):
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "paddle.stl")
+
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing file", f"Could not find paddle.stl in {script_dir}")
+
+            self.plotter.clear()
+            self.plotter.add_axes()
+            self.plotter.add_mesh(pv.Cube(), color="gray", opacity=0.4)
+            self.plotter.reset_camera()
+            return
+
+        try:
+            mesh = pv.read(path)
+
+            self.plotter.clear()
+            self.plotter.add_axes()
+
+            self.plotter.add_mesh(
+                mesh,
+                show_edges=False,
+                smooth_shading=True,
+                color="darkgreen"
+            )
+
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load STL:\n{e}")
+
+    # ---------------------------------------------------
+    # GYRO DATA RECORDING
+    # ---------------------------------------------------
+    def start_recording(self):
+        """Start recording gyro data in worker thread"""
+        self.record_btn.setEnabled(False)
+        self.worker_record = GyroRecordingWorker()
+        self.worker_record.progress.connect(print)  # Print to console
+        self.worker_record.finished.connect(self._on_recording_finished)
+        self.worker_record.error.connect(self._on_recording_error)
+        self.worker_record.start()
+
+    def _on_recording_finished(self, sample_count):
+        """Called when recording completes"""
+        print(f"[✓] Recording finished: {sample_count} samples")
+        QMessageBox.information(self, "Success", f"Gyro data recorded!\n{sample_count} samples saved to gyro_data.csv")
+        self.record_btn.setEnabled(True)
+
+    def _on_recording_error(self, error_msg):
+        """Called when recording fails"""
+        print(f"[!] Recording error: {error_msg}")
+        QMessageBox.critical(self, "Recording Error", error_msg)
+        self.record_btn.setEnabled(True)
+
+    # ---------------------------------------------------
+    # LOAD and ANIMATE GYRO DATA
+    # ---------------------------------------------------
+    def start_animation(self):
+        """Create animation from saved gyro data"""
+        if not os.path.exists(GYRO_DATA_FILE):
+            QMessageBox.warning(self, "No Data", "No gyro data found.\nClick 'Record Gyro Data' first.")
+            return
+
+        self.animate_btn.setEnabled(False)
+        self.worker_animate = GyroAnimationWorker()
+        self.worker_animate.progress.connect(print)  # Print to console
+        self.worker_animate.finished.connect(self._on_animation_finished)
+        self.worker_animate.error.connect(self._on_animation_error)
+        self.worker_animate.start()
+
+    def _on_animation_finished(self, video_path):
+        """Called when animation completes"""
+        print(f"[✓] Animation finished: {video_path}")
+        QMessageBox.information(self, "Success", f"Animation created!\nVideo saved to:\n{video_path}")
+        self.animate_btn.setEnabled(True)
+
+    def _on_animation_error(self, error_msg):
+        """Called when animation fails"""
+        print(f"[!] Animation error: {error_msg}")
+        QMessageBox.critical(self, "Animation Error", error_msg)
+        self.animate_btn.setEnabled(True)
+
+
+class NexshotMain(QMainWindow):
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Nexshot")
+        self.resize(1000, 700)
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self._build_welcome()
+        self._build_paddle()
+
+    def _build_welcome(self):
+
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 20, 20, 20)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "nexshot_icon.png")
+
+        if os.path.exists(icon_path):
+
+            pix = QPixmap(icon_path).scaledToWidth(360)
+
+            img = QLabel()
+            img.setPixmap(pix)
+            img.setAlignment(Qt.AlignCenter)
+
+            v.addWidget(img, alignment=Qt.AlignCenter)
+
+        else:
+
+            placeholder = QLabel("[no icon available]")
+            placeholder.setAlignment(Qt.AlignCenter)
+
+            v.addWidget(placeholder, alignment=Qt.AlignCenter)
+
+        title = QLabel("Welcome to Nexshot")
+
+        title.setFont(QFont("Arial", 28))
+        title.setAlignment(Qt.AlignCenter)
+
+        v.addWidget(title, alignment=Qt.AlignCenter)
+        v.addStretch()
+
+        btn_row = QHBoxLayout()
+
+        self.game_btn = QPushButton("Gameplay")
+        self.paddle_btn = QPushButton("Our Paddle")
+
+        btn_row.addStretch()
+        btn_row.addWidget(self.game_btn)
+        btn_row.addWidget(self.paddle_btn)
+        btn_row.addStretch()
+
+        v.addLayout(btn_row)
+
+        self.game_btn.clicked.connect(self._show_gameplay)
+        self.paddle_btn.clicked.connect(self._show_paddle)
+
+        self.stack.addWidget(w)
+
+    def _build_paddle(self):
+
+        self.paddle_page = PaddleViewer()
+
+        self.paddle_page.back_btn.clicked.connect(
+            lambda: self.stack.setCurrentIndex(0)
+        )
+
+        self.stack.addWidget(self.paddle_page)
+
+    def _show_gameplay(self):
+
+        QMessageBox.information(
+            self,
+            "Gameplay",
+            "Gameplay screen placeholder"
+        )
+
+    def _show_paddle(self):
+
+        self.stack.setCurrentWidget(self.paddle_page)
+
+        try:
+            self.paddle_page.load_default()
+        except Exception:
+            pass
+
+
+def main():
+
+    app = QApplication(sys.argv)
+
+    win = NexshotMain()
+    win.show()
+
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
