@@ -1,0 +1,198 @@
+import os
+import asyncio
+from bleak import BleakScanner, BleakClient
+import numpy as np
+import pyvista as pv
+import imageio
+import time
+from scipy.signal import savgol_filter
+
+# ---------------- CONFIG ----------------
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+RECORD_TIME = 10  # seconds
+SAMPLE_RATE = 50  # Hz (higher sampling for smoother gyro data)
+ANIMATION_FPS = 30  # Higher FPS for smooth playback
+STL_FILE = r"C:\Users\Brooke\Downloads\VS Code\Captone Spring\paddle.stl"
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_gyro_animation.mp4")
+# --------------------------------------
+
+
+async def record_ble_gyro():
+    print("[*] Scanning for BLE...")
+    devices = await BleakScanner.discover()
+    dev = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+    if not dev:
+        print("[!] BLE device not found")
+        return None, None, None, None
+
+    print("[✓] Found device:", dev.address)
+
+    gx, gy, gz, ts = [], [], [], []
+
+    async with BleakClient(dev.address) as client:
+        print(f"[✓] Connected to {DEVICE_NAME}")
+        print(f"[*] Recording for {RECORD_TIME} seconds at {SAMPLE_RATE}Hz...")
+        start = time.time()
+        next_sample_time = start
+        sample_interval = 1.0 / SAMPLE_RATE
+
+        while time.time() - start < RECORD_TIME:
+            current_time = time.time()
+            
+            # Wait until next sample time for consistent sampling
+            if current_time < next_sample_time:
+                await asyncio.sleep(next_sample_time - current_time)
+
+            data = await client.read_gatt_char(CHAR_UUID)
+            vals = data.decode().strip().split(",")
+
+            if len(vals) >= 6:
+                gx.append(float(vals[3]))
+                gy.append(float(vals[4]))
+                gz.append(float(vals[5]))
+                ts.append(current_time - start)
+
+            next_sample_time += sample_interval
+
+    print("[✓] Recording finished")
+    print("Samples:", len(ts), "Duration:", ts[-1])
+
+    return np.array(gx), np.array(gy), np.array(gz), np.array(ts)
+
+
+def preprocess_gyro(gx, gy, gz):
+    print("[*] Applying advanced filtering and smoothing...")
+
+    # Apply Savitzky-Golay filter with adaptive window size
+    window_length = min(21, len(gx) // 2 * 2 + 1)  # Larger window for smoother filtering
+    if window_length >= 5:
+        gx = savgol_filter(gx, window_length, 3)
+        gy = savgol_filter(gy, window_length, 3)
+        gz = savgol_filter(gz, window_length, 3)
+
+    # Apply additional low-pass filtering for extra smoothness
+    from scipy.signal import butter, filtfilt
+    try:
+        # 2nd order Butterworth low-pass filter at 5Hz cutoff
+        nyquist = SAMPLE_RATE / 2
+        cutoff = min(5.0, nyquist * 0.8)  # 5Hz cutoff or 80% of Nyquist
+        b, a = butter(2, cutoff / nyquist, btype='low')
+        gx = filtfilt(b, a, gx)
+        gy = filtfilt(b, a, gy)
+        gz = filtfilt(b, a, gz)
+        print(f"[✓] Applied Butterworth low-pass filter (cutoff: {cutoff}Hz)")
+    except Exception as e:
+        print(f"[!] Butterworth filter failed: {e}, using Savitzky-Golay only")
+
+    # bias removal (first second)
+    n_bias = min(30, len(gx))
+    bx, by, bz = np.mean(gx[:n_bias]), np.mean(gy[:n_bias]), np.mean(gz[:n_bias])
+    gx -= bx
+    gy -= by
+    gz -= bz
+
+    print(f"[✓] Bias removed: bx={bx:.3f}, by={by:.3f}, bz={bz:.3f}")
+    return gx, gy, gz
+
+
+def animate_paddle_offscreen(gx, gy, gz, ts):
+    print("[*] Creating ultra-smooth interpolated animation...")
+    
+    # Create cubic spline interpolation for ultra-smooth gyro motion
+    from scipy.interpolate import CubicSpline
+    
+    # Create interpolation functions
+    cs_gx = CubicSpline(ts, gx, bc_type='natural')
+    cs_gy = CubicSpline(ts, gy, bc_type='natural')
+    cs_gz = CubicSpline(ts, gz, bc_type='natural')
+
+    plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
+
+    mesh = pv.read(STL_FILE)
+    mesh.translate(-np.array(mesh.center))
+
+    actor = plotter.add_mesh(mesh, color="green")
+    plotter.add_axes()
+    plotter.set_background("white")
+    plotter.show(auto_close=False)
+
+    # Create video writer with better codec
+    try:
+        writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS, codec='libx264', pixelformat='yuv420p')
+        print(f"[✓] Using H.264 codec at {ANIMATION_FPS} FPS")
+    except Exception as e:
+        print(f"[!] H.264 codec failed: {e}, using default")
+        writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
+
+    # Calculate animation parameters
+    duration = ts[-1]
+    frame_interval = 1.0 / ANIMATION_FPS
+    total_frames = int(duration * ANIMATION_FPS)
+
+    print(f"[*] Rendering {total_frames} frames at {ANIMATION_FPS} FPS (duration: {duration:.1f}s)")
+
+    for frame_idx in range(total_frames):
+        # Calculate current time in animation
+        current_time = frame_idx * frame_interval
+        
+        # Ensure we don't exceed data range
+        current_time = min(current_time, ts[-1])
+        
+        # Get interpolated angular velocities for ultra-smooth motion
+        gx_val = float(cs_gx(current_time))
+        gy_val = float(cs_gy(current_time))
+        gz_val = float(cs_gz(current_time))
+        
+        # Get interval for this frame
+        if frame_idx < total_frames - 1:
+            next_time = min((frame_idx + 1) * frame_interval, ts[-1])
+            dt = next_time - current_time
+        else:
+            dt = frame_interval
+        
+        # Convert angular velocities to rotations
+        rx = gx_val * np.pi / 180.0 * dt
+        ry = gy_val * np.pi / 180.0 * dt
+        rz = gz_val * np.pi / 180.0 * dt
+        
+        # Apply smooth rotation
+        actor.rotate_x(np.degrees(rx))
+        actor.rotate_y(np.degrees(ry))
+        actor.rotate_z(np.degrees(rz))
+
+        # Add time indicator
+        plotter.add_text(f"t = {current_time:.2f} s", position="upper_left", font_size=12, name="time")
+        
+        plotter.render()
+        frame = plotter.screenshot(return_img=True)
+        writer.append_data(frame)
+        
+        # Progress indicator
+        if frame_idx % 50 == 0:
+            progress = (frame_idx / total_frames) * 100
+            print(f"[*] Rendering progress: {progress:.1f}% ({frame_idx}/{total_frames})")
+
+    writer.close()
+    plotter.close()
+
+    print(f"[✓] Ultra-smooth animation saved to: {VIDEO_OUT}")
+    print(f"[✓] Animation specs: {ANIMATION_FPS} FPS, {total_frames} frames, {duration:.1f}s duration")
+
+
+def main():
+    gx, gy, gz, ts = asyncio.run(record_ble_gyro())
+    if gx is None:
+        return
+    
+    print(f"[✓] Recorded {len(ts)} samples at {SAMPLE_RATE}Hz")
+
+    gx, gy, gz = preprocess_gyro(gx, gy, gz)
+    animate_paddle_offscreen(gx, gy, gz, ts)
+
+
+if __name__ == "__main__":
+    main()
