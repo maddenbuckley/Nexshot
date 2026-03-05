@@ -14,7 +14,9 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QStackedWidget, QMessageBox
 )
 from PyQt5.QtGui import QPixmap, QFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QUrl
+from PyQt5.QtMultimedia import QMediaPlayer, QMediaContent
+from PyQt5.QtMultimediaWidgets import QVideoWidget
 
 import pyvista as pv
 from pyvistaqt import QtInteractor
@@ -299,10 +301,12 @@ class PaddleViewer(QWidget):
         # Recording and animation buttons
         self.record_btn = QPushButton("Record Gyro Data")
         self.animate_btn = QPushButton("Create Animation from Data")
+        self.browse_videos_btn = QPushButton("Browse Videos")
         self.back_btn = QPushButton("Back")
 
         bar.addWidget(self.record_btn)
         bar.addWidget(self.animate_btn)
+        bar.addWidget(self.browse_videos_btn)
         bar.addStretch()
         bar.addWidget(self.back_btn)
 
@@ -311,6 +315,7 @@ class PaddleViewer(QWidget):
 
         self.record_btn.clicked.connect(self.start_recording)
         self.animate_btn.clicked.connect(self.start_animation)
+        self.browse_videos_btn.clicked.connect(self.browse_and_play_video)
 
     def load_default(self):
 
@@ -396,6 +401,87 @@ class PaddleViewer(QWidget):
         print(f"[!] Animation error: {error_msg}")
         QMessageBox.critical(self, "Animation Error", error_msg)
         self.animate_btn.setEnabled(True)
+
+    def browse_and_play_video(self):
+        """Browse and play any video file"""
+        from PyQt5.QtWidgets import QFileDialog
+        
+        # Get script directory as default
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        
+        # Open file dialog
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            script_dir,
+            "Video Files (*.mp4 *.avi *.mov *.mkv *.flv);;All Files (*.*)"
+        )
+        
+        if file_path:
+            self.play_video_window(file_path)
+
+    def play_video_window(self, video_path):
+        """Display video in a separate window"""
+        if not os.path.exists(video_path):
+            QMessageBox.warning(self, "File Not Found", f"Video file not found:\n{video_path}")
+            return
+        
+        # Create new window for video
+        video_window = QWidget()
+        video_window.setWindowTitle(f"Video Player - {os.path.basename(video_path)}")
+        video_window.resize(960, 720)
+        
+        layout = QVBoxLayout(video_window)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Create video player
+        media_player = QMediaPlayer()
+        video_widget = QVideoWidget()
+        media_player.setVideoOutput(video_widget)
+        
+        # Load and play video
+        media_player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
+        media_player.play()
+        
+        layout.addWidget(video_widget)
+        
+        # Add control buttons
+        control_layout = QHBoxLayout()
+        
+        def toggle_play():
+            if media_player.state() == QMediaPlayer.PlayingState:
+                media_player.pause()
+                play_btn.setText("Play")
+            else:
+                media_player.play()
+                play_btn.setText("Pause")
+        
+        play_btn = QPushButton("Pause")
+        play_btn.clicked.connect(toggle_play)
+        control_layout.addWidget(play_btn)
+        
+        stop_btn = QPushButton("Stop")
+        stop_btn.clicked.connect(media_player.stop)
+        control_layout.addWidget(stop_btn)
+        
+        # Full screen button
+        def toggle_fullscreen():
+            if video_window.isFullScreen():
+                video_window.showNormal()
+                fullscreen_btn.setText("Full Screen")
+            else:
+                video_window.showFullScreen()
+                fullscreen_btn.setText("Exit Full Screen")
+        
+        fullscreen_btn = QPushButton("Full Screen")
+        fullscreen_btn.clicked.connect(toggle_fullscreen)
+        control_layout.addWidget(fullscreen_btn)
+        
+        control_layout.addStretch()
+        
+        layout.addLayout(control_layout)
+        
+        video_window.show()
 
 
 class NexshotMain(QMainWindow):
