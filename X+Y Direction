@@ -1,0 +1,289 @@
+import os
+import asyncio
+import time
+import numpy as np
+import pyvista as pv
+import imageio
+from bleak import BleakScanner, BleakClient
+from scipy.signal import savgol_filter
+from scipy.spatial.transform import Rotation as R, Slerp
+
+# ---------------- CONFIG ----------------
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+RECORD_TIME = 10          # seconds
+ANIMATION_FPS = 30
+SMOOTH_WINDOW = 9         # Savitzky-Golay smoothing
+SCALE_FACTOR = 1.5        # paddle size scaling
+GYRO_WEIGHT = 0.98        # weight of gyro in SLERP
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STL_FILE = os.path.join(SCRIPT_DIR, "paddle.stl")
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_demo_swing_xy.mp4")
+VIDEO_OUT_MULTI = os.path.join(SCRIPT_DIR, "paddle_demo_swing_multiview.mp4")
+
+# ---------------- GLOBAL DATA ----------------
+ax_data, ay_data, az_data = [], [], []
+gx_data, gy_data, gz_data = [], [], []
+timestamps = []
+
+# ---------------- BLE RECORDING ----------------
+async def record_motion():
+    print("Scanning for device...")
+    devices = await BleakScanner.discover()
+    device = next((d for d in devices if d.name == DEVICE_NAME), None)
+    if not device:
+        print("Device not found")
+        return
+
+    print("Connecting to", device.address)
+    async with BleakClient(device.address) as client:
+        print("Recording motion...")
+        start_time = time.time()
+        while time.time() - start_time < RECORD_TIME:
+            data = await client.read_gatt_char(CHAR_UUID)
+            try:
+                text = data.decode().strip()
+                values = text.replace(",", " ").split()
+                if len(values) < 6:
+                    continue
+                ax, ay, az, gx, gy, gz = map(float, values[:6])
+                ax_data.append(ax)
+                ay_data.append(ay)
+                az_data.append(az)
+                gx_data.append(gx)
+                gy_data.append(gy)
+                gz_data.append(gz)
+                timestamps.append(time.time())
+            except:
+                continue
+    print("Recording finished")
+
+# ---------------- SMOOTH DATA ----------------
+def smooth_data(data):
+    if len(data) < SMOOTH_WINDOW:
+        return np.array(data)
+    return savgol_filter(data, SMOOTH_WINDOW, 3)
+
+# ---------------- COMPUTE ORIENTATION ----------------
+def compute_orientation():
+    ax = smooth_data(ax_data)
+    ay = smooth_data(ay_data)
+    az = smooth_data(az_data)
+    gx = smooth_data(gx_data)
+    gy = smooth_data(gy_data)
+    gz = smooth_data(gz_data)
+
+    orientations = []
+    orientation = R.identity()
+    dt = 1 / 50
+
+    for i in range(len(ax)):
+        gyro_vec = np.array([gx[i], gy[i], gz[i]]) * np.pi / 180 * dt
+        gyro_rot = R.from_rotvec(gyro_vec)
+        orientation = orientation * gyro_rot
+
+        # Accelerometer tilt correction
+        g = np.array([ax[i], ay[i], az[i]])
+        g_norm = np.linalg.norm(g)
+        if g_norm > 0:
+            g /= g_norm
+        pitch = np.arctan2(-g[0], np.sqrt(g[1]**2 + g[2]**2))
+        roll = np.arctan2(g[1], g[2])
+        accel_rot = R.from_euler('xy', [pitch, roll])
+
+        # SLERP blend gyro + accel
+        key_times = [0, 1]
+        key_rots = R.concatenate([orientation, accel_rot])
+        slerp = Slerp(key_times, key_rots)
+        orientation = slerp([GYRO_WEIGHT])[0]
+
+        orientations.append(orientation)
+
+    return orientations
+
+# ---------------- COMPUTE SWING TRANSLATION ----------------
+def compute_swing_translation(orientations):
+    # forward/back = pitch (X-axis), side-to-side = roll (Y-axis)
+    positions = []
+
+    for orientation in orientations:
+        euler_deg = orientation.as_euler("xyz", degrees=True)
+        pitch_deg = euler_deg[0]  # X-axis
+        roll_deg = euler_deg[2]   # Z-axis in 'xyz' corresponds to Y-axis tilt
+
+        # forward/back scaling
+        x = np.sin(np.radians(pitch_deg)) * 2.0  # adjust multiplier
+        # side-to-side scaling
+        y = np.sin(np.radians(roll_deg)) * 1.0   # adjust multiplier
+
+        positions.append([x, y, 0])  # Z stays at 0
+    return np.array(positions)
+
+# ---------------- ANIMATION ----------------
+def animate_paddle():
+    if len(ax_data) < 5:
+        print("Not enough data recorded")
+        return
+
+    print("Computing orientation...")
+    orientations = compute_orientation()
+    positions = compute_swing_translation(orientations)
+
+    mesh = pv.read(STL_FILE)
+    mesh.translate(-np.array(mesh.center))
+    mesh.scale([SCALE_FACTOR]*3)
+
+    plotter = pv.Plotter(off_screen=True, window_size=(900,700))
+    actor = plotter.add_mesh(mesh, color="green")
+    plotter.set_background("white")
+    plotter.add_axes()
+
+    writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
+    print("Rendering animation...")
+
+    for i, orientation in enumerate(orientations):
+        # Rotation
+        rot = orientation.as_euler("xyz", degrees=True)
+        actor.SetOrientation(rot)
+
+        # Forward + side-to-side translation
+        pos = positions[i]
+        actor.SetPosition(pos)
+
+        # dynamic camera
+        bounds = actor.bounds
+        max_dim = max(bounds[1]-bounds[0], bounds[3]-bounds[2], bounds[5]-bounds[4])
+        center = [(bounds[0]+bounds[1])/2, (bounds[2]+bounds[3])/2, (bounds[4]+bounds[5])/2]
+        plotter.camera_position = [
+            (max_dim*2 + center[0], max_dim*2 + center[1], max_dim*2 + center[2]),
+            center,
+            (0,0,1)
+        ]
+
+        plotter.render()
+        frame = plotter.screenshot(return_img=True)
+        writer.append_data(frame)
+
+    writer.close()
+    plotter.close()
+    print("Video saved:", VIDEO_OUT)
+
+# -------- MULTI-VIEW ANIMATION (Front + Top) --------
+def animate_paddle_multiview():
+    """
+    Show paddle swing from two angles for clear X-Y motion visualization:
+    
+    LEFT (FRONT VIEW):  Looking at the paddle from the front
+      - Shows LEFT-RIGHT motion (Y-axis side to side)
+      - Shows paddle tilting left and right
+    
+    RIGHT (TOP VIEW):   Looking down at the paddle from above
+      - Shows FORWARD-BACKWARD motion (X-axis)
+      - Shows LEFT-RIGHT motion (Y-axis)
+      - Red line shows the paddle's trajectory path
+      - Perfect for visualizing a paddle swing!
+    """
+    """Show paddle swing from front view (Y motion) and top view (X-Y motion)"""
+    if len(ax_data) < 5:
+        print("Not enough data recorded")
+        return
+
+    print("Computing orientation...")
+    orientations = compute_orientation()
+    positions = compute_swing_translation(orientations)
+
+    mesh = pv.read(STL_FILE)
+    mesh.translate(-np.array(mesh.center))
+    mesh.scale([SCALE_FACTOR]*3)
+
+    writer = imageio.get_writer(VIDEO_OUT_MULTI, fps=ANIMATION_FPS)
+    print("Rendering multi-view animation...")
+
+    # Create side-by-side images
+    for frame_idx, (orientation, pos) in enumerate(zip(orientations, positions)):
+        rot = orientation.as_euler("xyz", degrees=True)
+        
+        # --- FRONT VIEW (looking at the swing side-to-side Y motion) ---
+        plotter_front = pv.Plotter(off_screen=True, window_size=(450, 700))
+        mesh_front = mesh.copy()
+        actor_front = plotter_front.add_mesh(mesh_front, color="darkgreen", show_edges=True, edge_color="black")
+        actor_front.SetOrientation(rot)
+        actor_front.SetPosition(pos)
+        
+        plotter_front.set_background("lightgray")
+        plotter_front.add_title("Front View (Y = Left-Right)", font_size=14)
+        
+        # Front view camera: looking at YZ plane
+        bounds = actor_front.bounds
+        max_dim = max(bounds[3]-bounds[2], bounds[5]-bounds[4])
+        center_front = [0, (bounds[2]+bounds[3])/2, (bounds[4]+bounds[5])/2]
+        plotter_front.camera_position = [
+            (max_dim*3, center_front[1], center_front[2]),
+            center_front,
+            (0, 0, 1)
+        ]
+        
+        # Add grid floor for reference
+        grid_front = pv.Plane(i_resolution=10, j_resolution=1, i_size=4, j_size=0.5)
+        grid_front.translate((0, center_front[1], -1))
+        plotter_front.add_mesh(grid_front, color="white", opacity=0.3, style="wireframe")
+        
+        plotter_front.render()
+        frame_front = plotter_front.screenshot(return_img=True)
+        plotter_front.close()
+        
+        # --- TOP VIEW (looking down at X-Y motion like a paddle swing) ---
+        plotter_top = pv.Plotter(off_screen=True, window_size=(450, 700))
+        mesh_top = mesh.copy()
+        actor_top = plotter_top.add_mesh(mesh_top, color="darkblue", show_edges=True, edge_color="black")
+        actor_top.SetOrientation(rot)
+        actor_top.SetPosition(pos)
+        
+        plotter_top.set_background("lightgray")
+        plotter_top.add_title("Top View (X = Forward-Back, Y = L-R)", font_size=14)
+        
+        # Top view camera: looking straight down at XY plane
+        bounds = actor_top.bounds
+        max_dim = max(bounds[1]-bounds[0], bounds[3]-bounds[2])
+        center_top = [(bounds[0]+bounds[1])/2, (bounds[2]+bounds[3])/2, 0]
+        plotter_top.camera_position = [
+            (center_top[0], center_top[1], max_dim*3),
+            center_top,
+            (0, 1, 0)  # Up direction
+        ]
+        
+        # Add grid floor to show motion clearly
+        grid_top = pv.Plane(i_resolution=10, j_resolution=10, i_size=4, j_size=4)
+        grid_top.translate((0, 0, -1))
+        plotter_top.add_mesh(grid_top, color="white", opacity=0.3, style="wireframe")
+        
+        # Add trajectory path
+        if frame_idx > 0:
+            traj_points = positions[:frame_idx+1]
+            traj_points_line = np.column_stack([traj_points[:, 0], traj_points[:, 1], np.zeros(len(traj_points))])
+            plotter_top.add_lines(traj_points_line, color="red", width=2, connected=True)
+        
+        plotter_top.render()
+        frame_top = plotter_top.screenshot(return_img=True)
+        plotter_top.close()
+        
+        # Combine side-by-side
+        combined_frame = np.concatenate([frame_front, frame_top], axis=1)
+        writer.append_data(combined_frame)
+        
+        if (frame_idx + 1) % 30 == 0:
+            print(f"  Rendered {frame_idx + 1} / {len(orientations)} frames")
+
+    writer.close()
+    print("Multi-view video saved:", VIDEO_OUT_MULTI)
+
+# ---------------- MAIN ----------------
+async def main():
+    await record_motion()
+    # animate_paddle()
+    animate_paddle_multiview()  # Show front+top view for clear X-Y motion
+
+if __name__ == "__main__":
+    asyncio.run(main())
