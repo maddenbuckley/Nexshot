@@ -6,6 +6,7 @@ import pyvista as pv
 import imageio
 from bleak import BleakScanner, BleakClient
 from scipy.signal import savgol_filter
+from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R, Slerp
 
 # ---------------- CONFIG ----------------
@@ -13,7 +14,7 @@ DEVICE_NAME = "Nano33BLE_IMU"
 CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
 
 RECORD_TIME = 10
-ANIMATION_FPS = 30
+ANIMATION_FPS = 60
 SMOOTH_WINDOW = 25
 
 # Motion scaling
@@ -46,19 +47,14 @@ async def record_motion():
 
     async with BleakClient(device.address) as client:
 
-        print("Recording motion...")
-        start = time.time()
-
-        while time.time() - start < RECORD_TIME:
-
-            data = await client.read_gatt_char(CHAR_UUID)
+        def notification_handler(sender, data):
 
             try:
                 text = data.decode().strip()
                 vals = text.replace(",", " ").split()
 
                 if len(vals) < 6:
-                    continue
+                    return
 
                 ax, ay, az, gx, gy, gz = map(float, vals[:6])
 
@@ -71,9 +67,17 @@ async def record_motion():
                 gz_data.append(gz)
 
             except:
-                continue
+                pass
+
+        print("Recording Motion...")
+        await client.start_notify(CHAR_UUID, notification_handler)
+
+        await asyncio.sleep(RECORD_TIME)
+
+        await client.stop_notify(CHAR_UUID)
 
     print("Recording finished")
+    print("Samples captured:", len(ax_data))
 
 # ---------------- SMOOTH ----------------
 def smooth_data(data):
@@ -104,7 +108,7 @@ def compute_orientation():
     orientations = []
     orientation = R.identity()
 
-    dt = 1/50
+    dt = RECORD_TIME / len(ax) 
 
     for i in range(len(ax)):
 
@@ -156,7 +160,42 @@ def compute_swing_translation(orientations):
 
     return positions
 
-# ---------------- ANIMATION ----------------
+# -------- INTERPOLATE FOR SMOOTHER MOTION --------
+def interpolate_motion(orientations, positions, target_frames):
+    """
+    Interpolate orientations and positions using cubic splines
+    to create smoother motion with more frames
+    """
+    n_keyframes = len(orientations)
+    
+    if n_keyframes < 4:
+        return orientations, positions  # Not enough data to interpolate
+    
+    # Use time as parameter for interpolation
+    time_original = np.linspace(0, 1, n_keyframes)
+    time_interp = np.linspace(0, 1, target_frames)
+    
+    # Convert orientations to Euler angles for interpolation
+    euler_angles = np.array([o.as_euler("xyz", degrees=True) for o in orientations])
+    
+    # Interpolate each Euler angle using cubic spline
+    interp_euler = np.zeros((target_frames, 3))
+    for i in range(3):
+        cs = CubicSpline(time_original, euler_angles[:, i])
+        interp_euler[:, i] = cs(time_interp)
+    
+    # Convert back to Rotation objects
+    interp_orientations = [R.from_euler("xyz", e, degrees=True) for e in interp_euler]
+    
+    # Interpolate positions using cubic spline
+    interp_positions = np.zeros((target_frames, 3))
+    for i in range(3):
+        cs = CubicSpline(time_original, positions[:, i])
+        interp_positions[:, i] = cs(time_interp)
+    
+    return interp_orientations, interp_positions
+
+# -------- ANIMATION --------
 def animate_paddle():
     if len(ax_data) < 5:
         print("Not enough motion data")
@@ -165,6 +204,11 @@ def animate_paddle():
     # compute orientation and positions
     orientations = compute_orientation()
     positions = compute_swing_translation(orientations)
+    
+    # Interpolate for smoother motion (minimal interpolation for 10-second animation)
+    target_frames = int(RECORD_TIME * ANIMATION_FPS)  # Keep animation at original duration
+    print(f"Interpolating from {len(orientations)} frames to {target_frames} frames...")
+    orientations, positions = interpolate_motion(orientations, positions, target_frames)
 
     # read paddle mesh
     mesh = pv.read(STL_FILE)
@@ -197,10 +241,7 @@ def animate_paddle():
     center = (bounds_min + bounds_max) / 2
     swing_size = np.linalg.norm(bounds_max - bounds_min)
 
-    grid_size = swing_size * 3
-    grid = pv.Plane(i_resolution=12, j_resolution=12, i_size=grid_size, j_size=grid_size)
-    grid.translate((center[0], center[1], center[2] - grid_size*0.15))
-    plotter.add_mesh(grid, color="lightgray", style="wireframe", opacity=0.5)
+    # Grid removed for cleaner visualization
 
     # ---------------- BALL ----------------
     ball = pv.Sphere(radius=0.18)
@@ -263,10 +304,7 @@ def animate_paddle():
         plotter.render()
         frame = plotter.screenshot(return_img=True)
 
-        # slow down playback
-        slow_factor = 3
-        for _ in range(slow_factor):
-            writer.append_data(frame)
+        writer.append_data(frame)
 
     writer.close()
     plotter.close()
