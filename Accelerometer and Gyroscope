@@ -1,0 +1,282 @@
+import os
+import asyncio
+import time
+import numpy as np
+import pyvista as pv
+import imageio
+from bleak import BleakScanner, BleakClient
+from scipy.signal import savgol_filter
+from scipy.spatial.transform import Rotation as R, Slerp
+
+# ---------------- CONFIG ----------------
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+RECORD_TIME = 10
+ANIMATION_FPS = 30
+SMOOTH_WINDOW = 25
+
+# Motion scaling
+X_SCALE = 10
+Y_SCALE = 8
+Z_SCALE = 8
+
+GYRO_WEIGHT = 0.98
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STL_FILE = os.path.join(SCRIPT_DIR, "paddle.stl")
+VIDEO_OUT = os.path.join(SCRIPT_DIR, "paddle_swing_demo.mp4")
+
+# ---------------- DATA STORAGE ----------------
+ax_data, ay_data, az_data = [], [], []
+gx_data, gy_data, gz_data = [], [], []
+
+# ---------------- BLE RECORDING ----------------
+async def record_motion():
+
+    print("Scanning for device...")
+    devices = await BleakScanner.discover()
+    device = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+    if not device:
+        print("Device not found")
+        return
+
+    print("Connecting to", device.address)
+
+    async with BleakClient(device.address) as client:
+
+        print("Recording motion...")
+        start = time.time()
+
+        while time.time() - start < RECORD_TIME:
+
+            data = await client.read_gatt_char(CHAR_UUID)
+
+            try:
+                text = data.decode().strip()
+                vals = text.replace(",", " ").split()
+
+                if len(vals) < 6:
+                    continue
+
+                ax, ay, az, gx, gy, gz = map(float, vals[:6])
+
+                ax_data.append(ax)
+                ay_data.append(ay)
+                az_data.append(az)
+
+                gx_data.append(gx)
+                gy_data.append(gy)
+                gz_data.append(gz)
+
+            except:
+                continue
+
+    print("Recording finished")
+
+# ---------------- SMOOTH ----------------
+def smooth_data(data):
+    """Apply Savitzky-Golay filter for smooth motion"""
+    if len(data) < SMOOTH_WINDOW:
+        return np.array(data)
+    
+    # Apply filter with polynomial order 3 for smooth curves
+    smoothed = savgol_filter(data, SMOOTH_WINDOW, 3)
+    
+    # Apply filter twice for even smoother results
+    if len(smoothed) >= SMOOTH_WINDOW:
+        smoothed = savgol_filter(smoothed, SMOOTH_WINDOW, 3)
+    
+    return smoothed
+
+# ---------------- ORIENTATION ----------------
+def compute_orientation():
+
+    ax = smooth_data(ax_data)
+    ay = smooth_data(ay_data)
+    az = smooth_data(az_data)
+
+    gx = smooth_data(gx_data)
+    gy = smooth_data(gy_data)
+    gz = smooth_data(gz_data)
+
+    orientations = []
+    orientation = R.identity()
+
+    dt = 1/50
+
+    for i in range(len(ax)):
+
+        gyro_vec = np.array([gx[i], gy[i], gz[i]]) * np.pi/180 * dt
+        gyro_rot = R.from_rotvec(gyro_vec)
+
+        orientation = orientation * gyro_rot
+
+        g = np.array([ax[i], ay[i], az[i]])
+        g /= np.linalg.norm(g)
+
+        pitch = np.arctan2(-g[0], np.sqrt(g[1]**2 + g[2]**2))
+        roll = np.arctan2(g[1], g[2])
+
+        accel_rot = R.from_euler('xy', [pitch, roll])
+
+        key_times = [0,1]
+        key_rots = R.concatenate([orientation, accel_rot])
+
+        slerp = Slerp(key_times, key_rots)
+        orientation = slerp([GYRO_WEIGHT])[0]
+
+        orientations.append(orientation)
+
+    base = orientations[0].inv()
+    orientations = [base * o for o in orientations]
+
+    return orientations
+
+# ---------------- TRANSLATION ----------------
+def compute_swing_translation(orientations):
+
+    positions = []
+
+    for orientation in orientations:
+
+        pitch, roll, yaw = orientation.as_euler("xyz", degrees=True)
+
+        x = pitch * 0.05 * X_SCALE
+        y = yaw * 0.05 * Y_SCALE
+        z = roll * 0.05 * Z_SCALE
+
+        positions.append([x,y,z])
+
+    positions = np.array(positions)
+
+    for i in range(3):
+        positions[:, i] = savgol_filter(positions[:, i], 11, 3)
+
+    return positions
+
+# ---------------- ANIMATION ----------------
+def animate_paddle():
+    if len(ax_data) < 5:
+        print("Not enough motion data")
+        return
+
+    # compute orientation and positions
+    orientations = compute_orientation()
+    positions = compute_swing_translation(orientations)
+
+    # read paddle mesh
+    mesh = pv.read(STL_FILE)
+    mesh.translate(-np.array(mesh.center))
+    mesh.rotate_x(90)
+    mesh.rotate_z(-90)
+    mesh.rotate_y(180)
+
+    # scale paddle for visibility
+    mesh.scale([0.35, 0.35, 0.35])
+
+    plotter = pv.Plotter(off_screen=True, window_size=(912, 704))
+    actor = plotter.add_mesh(
+        mesh,
+        color="darkgreen",
+        show_edges=True,
+        edge_color="black"
+    )
+    plotter.set_background("white")
+    plotter.add_axes()
+
+    # ---------------- GRID ----------------
+    paddle_bounds = mesh.bounds  # (xmin,xmax, ymin,ymax, zmin,zmax)
+    motion_bounds_min = positions.min(axis=0)
+    motion_bounds_max = positions.max(axis=0)
+
+    # combine bounds for full scene
+    bounds_min = np.minimum(paddle_bounds[::2], motion_bounds_min)
+    bounds_max = np.maximum(paddle_bounds[1::2], motion_bounds_max)
+    center = (bounds_min + bounds_max) / 2
+    swing_size = np.linalg.norm(bounds_max - bounds_min)
+
+    grid_size = swing_size * 3
+    grid = pv.Plane(i_resolution=12, j_resolution=12, i_size=grid_size, j_size=grid_size)
+    grid.translate((center[0], center[1], center[2] - grid_size*0.15))
+    plotter.add_mesh(grid, color="lightgray", style="wireframe", opacity=0.5)
+
+    # ---------------- BALL ----------------
+    ball = pv.Sphere(radius=0.18)
+    ball_actor = plotter.add_mesh(ball, color="orange")
+
+    # ---------------- CAMERA ----------------
+    cam_dist = swing_size * 2.5 + 6
+
+    camera_pos = (
+        center[0] + cam_dist,
+        center[1] - cam_dist,
+        center[2] + cam_dist * 0.6   # slightly lower so swings are visible
+    )
+
+    focal_point = (
+        center[0],
+        center[1],
+        center[2]
+    )
+
+    view_up = (0, 0, 1)
+
+    plotter.camera_position = [camera_pos, focal_point, view_up]
+
+    plotter.camera.zoom(0.9)
+
+    # ---------------- TRAIL ----------------
+    trail_actors = []
+    trail_length = 20
+    writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
+
+    print("Rendering animation...")
+    prev_rot = None
+
+    for orientation, pos in zip(orientations, positions):
+        rot = orientation.as_euler("xyz", degrees=True)
+        if prev_rot is not None:
+            rot = prev_rot * 0.7 + np.array(rot) * 0.3
+        prev_rot = rot
+
+        # update paddle
+        actor.SetOrientation(rot)
+        actor.SetPosition(pos)
+
+        # update ball following paddle tip
+        rot_matrix = orientation.as_matrix()
+        ball_offset = np.array([0.45, 0, 0.15])
+        rotated_offset = rot_matrix @ ball_offset
+        ball_actor.SetPosition(pos + rotated_offset)
+
+        # add trail
+        trail = pv.Sphere(radius=0.08, center=pos)
+        trail_actor = plotter.add_mesh(trail, color="blue", opacity=0.4)
+        trail_actors.append(trail_actor)
+
+        if len(trail_actors) > trail_length:
+            old_actor = trail_actors.pop(0)
+            plotter.remove_actor(old_actor)
+
+        plotter.render()
+        frame = plotter.screenshot(return_img=True)
+
+        # slow down playback
+        slow_factor = 3
+        for _ in range(slow_factor):
+            writer.append_data(frame)
+
+    writer.close()
+    plotter.close()
+    print("Video saved:", VIDEO_OUT)
+
+# ---------------- MAIN ----------------
+async def main():
+
+    await record_motion()
+    animate_paddle()
+
+if __name__ == "__main__":
+    asyncio.run(main())
