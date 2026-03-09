@@ -78,21 +78,15 @@ async def record_motion():
 
     print("Recording finished")
     print("Samples captured:", len(ax_data))
+    print("Sample rate:", len(ax_data) / RECORD_TIME, "Hz")
 
 # ---------------- SMOOTH ----------------
 def smooth_data(data):
-    """Apply Savitzky-Golay filter for smooth motion"""
+
     if len(data) < SMOOTH_WINDOW:
         return np.array(data)
-    
-    # Apply filter with polynomial order 3 for smooth curves
-    smoothed = savgol_filter(data, SMOOTH_WINDOW, 3)
-    
-    # Apply filter twice for even smoother results
-    if len(smoothed) >= SMOOTH_WINDOW:
-        smoothed = savgol_filter(smoothed, SMOOTH_WINDOW, 3)
-    
-    return smoothed
+
+    return savgol_filter(data, SMOOTH_WINDOW, 3)
 
 # ---------------- ORIENTATION ----------------
 def compute_orientation():
@@ -147,11 +141,14 @@ def compute_swing_translation(orientations):
 
         pitch, roll, yaw = orientation.as_euler("xyz", degrees=True)
 
-        x = pitch * 0.05 * X_SCALE
-        y = yaw * 0.05 * Y_SCALE
-        z = roll * 0.05 * Z_SCALE
+        x = pitch * 0.15 * X_SCALE
+        y = yaw * 0.15 * Y_SCALE
+        z = roll * 0.15 * Z_SCALE
 
-        positions.append([x,y,z])
+        tip_offset = np.array([0.35, 0, 0])
+        tip_world = orientation.apply(tip_offset)
+        
+        positions.append([x,y,z] + tip_world)
 
     positions = np.array(positions)
 
@@ -204,6 +201,7 @@ def animate_paddle():
     # compute orientation and positions
     orientations = compute_orientation()
     positions = compute_swing_translation(orientations)
+    path = pv.Spline(positions, 200)
     
     # Interpolate for smoother motion (minimal interpolation for 10-second animation)
     target_frames = int(RECORD_TIME * ANIMATION_FPS)  # Keep animation at original duration
@@ -213,9 +211,7 @@ def animate_paddle():
     # read paddle mesh
     mesh = pv.read(STL_FILE)
     mesh.translate(-np.array(mesh.center))
-    mesh.rotate_x(90)
-    mesh.rotate_z(-90)
-    mesh.rotate_y(180)
+    mesh.rotate_y(90)
 
     # scale paddle for visibility
     mesh.scale([0.35, 0.35, 0.35])
@@ -224,10 +220,10 @@ def animate_paddle():
     actor = plotter.add_mesh(
         mesh,
         color="darkgreen",
-        show_edges=True,
-        edge_color="black"
+        smooth_shading=True
     )
     plotter.set_background("white")
+    #plotter.add_mesh(path, color="red", line_width=4)
     plotter.add_axes()
 
     # ---------------- GRID ----------------
@@ -241,26 +237,16 @@ def animate_paddle():
     center = (bounds_min + bounds_max) / 2
     swing_size = np.linalg.norm(bounds_max - bounds_min)
 
-    # Grid removed for cleaner visualization
-
-    # ---------------- BALL ----------------
-    ball = pv.Sphere(radius=0.18)
-    ball_actor = plotter.add_mesh(ball, color="orange")
-
     # ---------------- CAMERA ----------------
     cam_dist = swing_size * 2.5 + 6
 
     camera_pos = (
         center[0] + cam_dist,
-        center[1] - cam_dist,
-        center[2] + cam_dist * 0.6   # slightly lower so swings are visible
+        center[1] + cam_dist,
+        center[2] + cam_dist * 0.8   # side view to emphasize X-axis motion
     )
 
-    focal_point = (
-        center[0],
-        center[1],
-        center[2]
-    )
+    focal_point = center
 
     view_up = (0, 0, 1)
 
@@ -268,9 +254,8 @@ def animate_paddle():
 
     plotter.camera.zoom(0.9)
 
-    # ---------------- TRAIL ----------------
-    trail_actors = []
-    trail_length = 20
+    print(plotter.camera_position)
+
     writer = imageio.get_writer(VIDEO_OUT, fps=ANIMATION_FPS)
 
     print("Rendering animation...")
@@ -285,21 +270,6 @@ def animate_paddle():
         # update paddle
         actor.SetOrientation(rot)
         actor.SetPosition(pos)
-
-        # update ball following paddle tip
-        rot_matrix = orientation.as_matrix()
-        ball_offset = np.array([0.45, 0, 0.15])
-        rotated_offset = rot_matrix @ ball_offset
-        ball_actor.SetPosition(pos + rotated_offset)
-
-        # add trail
-        trail = pv.Sphere(radius=0.08, center=pos)
-        trail_actor = plotter.add_mesh(trail, color="blue", opacity=0.4)
-        trail_actors.append(trail_actor)
-
-        if len(trail_actors) > trail_length:
-            old_actor = trail_actors.pop(0)
-            plotter.remove_actor(old_actor)
 
         plotter.render()
         frame = plotter.screenshot(return_img=True)
