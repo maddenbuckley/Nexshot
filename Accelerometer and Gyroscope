@@ -137,18 +137,15 @@ def compute_swing_translation(orientations):
 
     positions = []
 
+    tip_lenght = 0.35
+
     for orientation in orientations:
 
-        pitch, roll, yaw = orientation.as_euler("xyz", degrees=True)
+        tip_offset = np.array([tip_lenght, 0, 0])
 
-        x = pitch * 0.15 * X_SCALE
-        y = yaw * 0.15 * Y_SCALE
-        z = roll * 0.15 * Z_SCALE
-
-        tip_offset = np.array([0.35, 0, 0])
         tip_world = orientation.apply(tip_offset)
-        
-        positions.append([x,y,z] + tip_world)
+
+        positions.append(tip_world)
 
     positions = np.array(positions)
 
