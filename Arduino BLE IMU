@@ -2,16 +2,16 @@
 #include <Arduino_LSM9DS1.h>
 
 BLEService customService("19B10000-E8F2-537E-4F6C-D104768A1214");
-BLEStringCharacteristic ble_imu("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 80);
+BLEStringCharacteristic ble_imu("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 24);
 
 char imuBuffer[80];  // safer than String
 
 void setup() {
-  Serial.begin(9600);
+  Serial.begin(115200);
   //while (!Serial);  // Wait for Serial Monitor to open (optional)
 
   // Print CSV header
-  Serial.println("ax,ay,az,gx,gy,gz");
+  //Serial.println("ax,ay,az,gx,gy,gz");
 
   if (!IMU.begin()) {
     Serial.println("Failed to initialize IMU!");
