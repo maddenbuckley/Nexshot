@@ -1,61 +1,71 @@
 #include <ArduinoBLE.h>
 #include <Arduino_LSM9DS1.h>
 
-// Define a BLE Service
-BLEService imuService("1101");
+BLEService customService("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLEStringCharacteristic ble_imu("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 80);
 
-// Define characteristics for accelerometer and gyroscope
-BLECharacteristic accelCharacteristic("2101", BLERead | BLENotify, 32);
-BLECharacteristic gyroCharacteristic("2102", BLERead | BLENotify, 32);
+char imuBuffer[80];  // safer than String
 
 void setup() {
-  // Start IMU
+  Serial.begin(9600);
+  //while (!Serial);  // Wait for Serial Monitor to open (optional)
+
+  // Print CSV header
+  Serial.println("ax,ay,az,gx,gy,gz");
+
   if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU!");
     while (1);
   }
 
-  // Start BLE
+  Serial.println("IMU initialized");
+
   if (!BLE.begin()) {
+    Serial.println("BLE failed");
     while (1);
   }
 
   BLE.setLocalName("Nano33BLE_IMU");
-  BLE.setAdvertisedService(imuService);
-
-  imuService.addCharacteristic(accelCharacteristic);
-  imuService.addCharacteristic(gyroCharacteristic);
-  BLE.addService(imuService);
-
-  // Start advertising
+  BLE.setAdvertisedService(customService);
+  
+  customService.addCharacteristic(ble_imu);
+  BLE.addService(customService);
+  
   BLE.advertise();
+  
+  Serial.println("BLE advertising...");
 }
 
 void loop() {
   BLEDevice central = BLE.central();
 
   if (central) {
-    while (central.connected()) {
-      float ax, ay, az;
-      float gx, gy, gz;
+    Serial.print("Connected to: ");
+    Serial.println(central.address());
 
-      if (IMU.accelerationAvailable()) {
-        IMU.readAcceleration(ax, ay, az);
-      }
-      if (IMU.gyroscopeAvailable()) {
-        IMU.readGyroscope(gx, gy, gz);
-      }
+    while (central.connected()){
+      sendIMU();
+      //Send BLE notification
+      ble_imu.writeValue(imuBuffer);
 
-      // Pack data into text (you can also pack as binary if preferred)
-      char accelBuffer[32];
-      char gyroBuffer[32];
-      snprintf(accelBuffer, sizeof(accelBuffer), "%.2f,%.2f,%.2f", ax, ay, az);
-      snprintf(gyroBuffer, sizeof(gyroBuffer), "%.2f,%.2f,%.2f", gx, gy, gz);
-
-      // Send over BLE
-      accelCharacteristic.writeValue(accelBuffer);
-      gyroCharacteristic.writeValue(gyroBuffer);
-
-      delay(200); // 5 updates per second
+      delay(5); //~100-200 Hz loop speed
     }
+    Serial.println("Central disconnected");
+  }
+}
+
+// IMU Read
+void sendIMU() {
+  float ax, ay, az;
+  float gx, gy, gz;
+
+  // Only read when new data is available
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()){
+    IMU.readAcceleration(ax, ay, az);
+    IMU.readGyroscope(gx, gy, gz);
+
+    snprintf(imuBuffer, sizeof(imuBuffer), "%.3f,%.3f,%.3f,%.3f,%.3f,%.3f", ax, ay, az, gx, gy, gz);
+
+    Serial.println(imuBuffer);
   }
 }
