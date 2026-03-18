@@ -102,7 +102,7 @@ def compute_orientation():
     orientations = []
     orientation = R.identity()
 
-    dt = RECORD_TIME / len(ax) 
+    dt = 1 / (len(ax)) / RECORD_TIME
 
     for i in range(len(ax)):
 
@@ -156,38 +156,28 @@ def compute_swing_translation(orientations):
 
 # -------- INTERPOLATE FOR SMOOTHER MOTION --------
 def interpolate_motion(orientations, positions, target_frames):
-    """
-    Interpolate orientations and positions using cubic splines
-    to create smoother motion with more frames
-    """
+
     n_keyframes = len(orientations)
-    
+
     if n_keyframes < 4:
-        return orientations, positions  # Not enough data to interpolate
-    
-    # Use time as parameter for interpolation
+        return orientations, positions
+
     time_original = np.linspace(0, 1, n_keyframes)
     time_interp = np.linspace(0, 1, target_frames)
-    
-    # Convert orientations to Euler angles for interpolation
-    euler_angles = np.array([o.as_euler("xyz", degrees=True) for o in orientations])
-    
-    # Interpolate each Euler angle using cubic spline
-    interp_euler = np.zeros((target_frames, 3))
-    for i in range(3):
-        cs = CubicSpline(time_original, euler_angles[:, i])
-        interp_euler[:, i] = cs(time_interp)
-    
-    # Convert back to Rotation objects
-    interp_orientations = [R.from_euler("xyz", e, degrees=True) for e in interp_euler]
-    
-    # Interpolate positions using cubic spline
+
+    # -------- ORIENTATION INTERPOLATION (SLERP) --------
+    key_rots = R.concatenate(orientations)
+    slerp = Slerp(time_original, key_rots)
+    interp_orientations = slerp(time_interp)
+
+    # -------- POSITION INTERPOLATION --------
     interp_positions = np.zeros((target_frames, 3))
+
     for i in range(3):
         cs = CubicSpline(time_original, positions[:, i])
         interp_positions[:, i] = cs(time_interp)
-    
-    return interp_orientations, interp_positions
+
+    return list(interp_orientations), interp_positions
 
 # -------- ANIMATION --------
 def animate_paddle():
