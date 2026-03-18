@@ -13,7 +13,7 @@ from scipy.spatial.transform import Rotation as R, Slerp
 DEVICE_NAME = "Nano33BLE_IMU"
 CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
 
-RECORD_TIME = 10
+RECORD_TIME = 15
 ANIMATION_FPS = 60
 SMOOTH_WINDOW = 25
 
@@ -102,7 +102,7 @@ def compute_orientation():
     orientations = []
     orientation = R.identity()
 
-    dt = 1 / (len(ax)) / RECORD_TIME
+    dt = RECORD_TIME/(len(ax))
 
     for i in range(len(ax)):
 
@@ -135,22 +135,37 @@ def compute_orientation():
 # ---------------- TRANSLATION ----------------
 def compute_swing_translation(orientations):
 
+    ax = smooth_data(ax_data)
+    ay = smooth_data(ay_data)
+    az = smooth_data(az_data)
+
+    dt = RECORD_TIME / len(ax)
+
+    velocity = np.zeros(3)
+    position = np.zeros(3)
+
     positions = []
 
-    tip_lenght = 0.35
+    for i in range(len(ax)):
 
-    for orientation in orientations:
+        acc_body = np.array([ax[i], ay[i], az[i]])
 
-        tip_offset = np.array([tip_lenght, 0, 0])
+        # convert to world frame
+        acc_world = orientations[i].apply(acc_body)
 
-        tip_world = orientation.apply(tip_offset)
+        # remove gravity (approx)
+        acc_world[2] -= 1.0
 
-        positions.append(tip_world)
+        velocity += acc_world * dt
+        position += velocity * dt
+
+        positions.append(position.copy())
 
     positions = np.array(positions)
 
+    # smooth result
     for i in range(3):
-        positions[:, i] = savgol_filter(positions[:, i], 11, 3)
+        positions[:, i] = savgol_filter(positions[:, i], 21, 3)
 
     return positions
 
