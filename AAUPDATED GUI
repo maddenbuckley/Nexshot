@@ -26,6 +26,11 @@ from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
 from scipy.spatial.transform import Rotation as R, Slerp
 
+# ---------------- THREADING LOCKS ----------------
+import threading
+opencv_lock = threading.Lock()
+vtk_lock = threading.Lock()  # For VTK operations
+
 # ---------------- CONSTANTS ----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SCRIPT_DIR = BASE_DIR  # for assets
@@ -86,7 +91,7 @@ class RecordingWorker(QThread):
         orientations = compute_orientation(ax, ay, az, gx, gy, gz)
         positions = compute_swing_translation(orientations, ax, ay, az)
 
-        target_frames = int(RECORD_TIME * ANIMATION_FPS * 2)
+        target_frames = int(RECORD_TIME * ANIMATION_FPS * 1.2)  # Reduced from 2x to 1.2x for faster videos
         orientations, positions = interpolate_motion(
             orientations, positions, target_frames
         )
@@ -106,51 +111,101 @@ class RecordingWorker(QThread):
         mesh.rotate_y(90)
         mesh.scale([0.35, 0.35, 0.35])
 
-        plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
-        actor = plotter.add_mesh(mesh, color="darkgreen", smooth_shading=True)
-        plotter.add_axes()
+        plotter = pv.Plotter(off_screen=True, window_size=(800, 608))  # Divisible by 16 for video codec compatibility
+        actor = plotter.add_mesh(mesh, color="darkgreen", smooth_shading=False)  # Disable smooth shading for speed
+        plotter.add_axes(line_width=1)  # Simpler axes
         plotter.set_background("white")
         plotter.show(auto_close=False)
 
-        writer = imageio.get_writer(self.video_path, fps=ANIMATION_FPS)
+        writer = imageio.get_writer(self.video_path, fps=ANIMATION_FPS, macro_block_size=16, 
+                                   format='mp4', codec='libx264', 
+                                   quality=8, pixelformat='yuv420p')
 
         prev_rot = None
 
-        for i, (orientation, pos) in enumerate(zip(orientations, positions)):
-            rot = orientation.as_euler("xyz", degrees=True)
-            if prev_rot is not None:
-                rot = prev_rot * 0.7 + np.array(rot) * 0.3
-            prev_rot = rot
+        try:
+            for i, (orientation, pos) in enumerate(zip(orientations, positions)):
+                rot = orientation.as_euler("xyz", degrees=True)
+                if prev_rot is not None:
+                    rot = prev_rot * 0.7 + np.array(rot) * 0.3
+                prev_rot = rot
 
-            actor.SetOrientation(rot)
-            actor.SetPosition(pos)
-            plotter.render()
-            frame = plotter.screenshot(return_img=True)
-            writer.append_data(frame)
+                actor.SetOrientation(rot)
+                actor.SetPosition(pos)
+                plotter.render()
+                frame = plotter.screenshot(return_img=True)
+                writer.append_data(frame)
 
-            if i % 50 == 0:
-                progress = (i / len(orientations)) * 100
-                self.status_update.emit(f"[*] Rendering: {progress:.1f}%")
+                if i % 50 == 0:
+                    progress = (i / len(orientations)) * 100
+                    self.status_update.emit(f"[*] Rendering: {progress:.1f}%")
 
-        writer.close()
-        plotter.close()
+        except Exception as e:
+            print(f"Error during animation: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            writer.close()
+            plotter.close()
 
 # ---------------- PADDLE VIEWER ----------------
 class PaddleViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.plotter = QtInteractor(self)
-
+        self.plotter = None  # Initialize later to avoid OpenGL context issues
+        
         main = QVBoxLayout(self)
-        main.addWidget(self.plotter.interactor)
+        # Placeholder widget until plotter is initialized
+        self.placeholder = QLabel("Loading 3D viewer...")
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        main.addWidget(self.placeholder)
 
         bar = QHBoxLayout()
         self.back_btn = QPushButton("Back")
         bar.addWidget(self.back_btn)
         bar.addStretch()
         main.addLayout(bar)
+        
+        # Initialize plotter when widget is shown
+        self.shown = False
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.shown:
+            self.shown = True
+            self._init_plotter()
+
+    def _init_plotter(self):
+        """Initialize the plotter safely"""
+        with vtk_lock:
+            try:
+                # Remove placeholder
+                layout = self.layout()
+                layout.removeWidget(self.placeholder)
+                self.placeholder.hide()
+                
+                # Create plotter
+                self.plotter = QtInteractor(self)
+                layout.insertWidget(0, self.plotter.interactor)
+                
+                # Load default model
+                self.load_default()
+                
+            except Exception as e:
+                print(f"Failed to initialize 3D viewer: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                error_label = QLabel(f"3D Viewer Error:\n{str(e)}")
+                error_label.setAlignment(Qt.AlignCenter)
+                error_label.setStyleSheet("color: red; font-size: 10px;")
+                layout = self.layout()
+                layout.insertWidget(0, error_label)
 
     def load_default(self):
+        if self.plotter is None:
+            return  # Plotter not initialized yet
+            
         script_dir = os.path.dirname(os.path.abspath(__file__))
         path = os.path.join(script_dir, "paddle.stl")
 
@@ -178,10 +233,13 @@ class GameplayViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
-        self.plotter = QtInteractor(self)
+        self.plotter = None  # Initialize later to avoid OpenGL context issues
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self.plotter.interactor)
+        # Placeholder widget until plotter is initialized
+        self.plotter_placeholder = QLabel("Loading 3D viewer...")
+        self.plotter_placeholder.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.plotter_placeholder)
 
         # -------- CONTROLS --------
         controls = QHBoxLayout()
@@ -234,11 +292,55 @@ class GameplayViewer(QWidget):
         
         self.video_path = None
         self.worker = None
+        self.video_windows = []
         
         # Load initial video list
         self.refresh_video_list()
+        
+        # Initialize plotter when widget is shown
+        self.shown = False
 
-    # -------- START --------
+    def showEvent(self, event):
+        super().showEvent(event)
+        if not self.shown:
+            self.shown = True
+            self._init_plotter()
+
+    def _init_plotter(self):
+        """Initialize the plotter safely"""
+        with vtk_lock:
+            try:
+                # Remove placeholder
+                layout = self.layout()
+                layout.removeWidget(self.plotter_placeholder)
+                self.plotter_placeholder.hide()
+                
+                # Create plotter with error handling
+                self.plotter = QtInteractor(self)
+                # Insert plotter at the top (after left panel)
+                layout.insertWidget(1, self.plotter.interactor)
+                
+                # Ensure the plotter is properly initialized
+                if hasattr(self.plotter, 'interactor'):
+                    self.plotter.interactor.update()
+                
+            except Exception as e:
+                print(f"Failed to initialize 3D viewer: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                error_label = QLabel(f"3D Viewer Error:\n{str(e)}")
+                error_label.setAlignment(Qt.AlignCenter)
+                error_label.setStyleSheet("color: red; font-size: 10px;")
+                layout = self.layout()
+    def _ensure_plotter(self):
+        """Ensure plotter is initialized and available"""
+        if self.plotter is None:
+            if not self.shown:
+                self._init_plotter()
+            if self.plotter is None:
+                return False
+        return True
     def start_gameplay(self):
         if self.worker and self.worker.isRunning():
             return
@@ -329,36 +431,60 @@ class GameplayViewer(QWidget):
         if filename:
             self.play_video(filename)
 
-    def play_video(self, video_path):
-        """Play a video file using OpenCV"""
-        try:
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                QMessageBox.critical(self, "Error", "Could not open video file")
-                return
+    def play_video(self, video_path, speed_multiplier=3.0):
+        """Play a video file using OpenCV with adjustable speed"""
+        with opencv_lock:
+            try:
+                cap = cv2.VideoCapture(video_path)
+                if not cap.isOpened():
+                    QMessageBox.critical(self, "Error", "Could not open video file")
+                    return
 
-            # Create a window for video playback
-            cv2.namedWindow("Paddle Swing Video", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Paddle Swing Video", 800, 600)
-
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    break
-
-                cv2.imshow("Paddle Swing Video", frame)
+                # Get video properties
+                fps = cap.get(cv2.CAP_PROP_FPS)
+                if fps <= 0:
+                    fps = 30  # Default fallback
                 
-                # Exit on 'q' key or window close
-                if cv2.waitKey(25) & 0xFF == ord('q'):
-                    break
-                if cv2.getWindowProperty("Paddle Swing Video", cv2.WND_PROP_VISIBLE) < 1:
-                    break
+                # Calculate frame delay (faster playback)
+                base_delay = int(1000 / fps)  # Original speed
+                current_speed = speed_multiplier  # Use parameter
+                frame_delay = max(1, int(base_delay / current_speed))  # Faster speed
 
-            cap.release()
-            cv2.destroyAllWindows()
+                # Create a window for video playback
+                window_name = "Paddle Swing Video (Q=quit, SPACE=pause, ↑=faster, ↓=slower)"
+                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+                cv2.resizeWindow(window_name, 800, 600)
 
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to play video:\n{e}")
+                while cap.isOpened():
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    cv2.imshow(window_name, frame)
+                    
+                    # Handle keyboard input
+                    key = cv2.waitKey(frame_delay) & 0xFF
+                    if key == ord('q'):
+                        break
+                    elif key == 32:  # Spacebar to pause/unpause
+                        cv2.waitKey(0)  # Wait indefinitely until any key
+                    elif key == 82:  # Up arrow - faster
+                        current_speed = min(current_speed * 1.5, 8.0)
+                        frame_delay = max(1, int(base_delay / current_speed))
+                        print(f"Speed: {current_speed}x")
+                    elif key == 84:  # Down arrow - slower
+                        current_speed = max(current_speed / 1.5, 0.25)
+                        frame_delay = max(1, int(base_delay / current_speed))
+                        print(f"Speed: {current_speed}x")
+                    
+                    if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        break
+
+                cap.release()
+                cv2.destroyAllWindows()
+
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to play video:\n{e}")
 
     # -------- COUNTDOWN --------
     def countdown(self, t):
@@ -393,7 +519,7 @@ class GameplayViewer(QWidget):
         orientations = compute_orientation(ax, ay, az, gx, gy, gz)
         positions = compute_swing_translation(orientations, ax, ay, az)
 
-        target_frames = int(RECORD_TIME * ANIMATION_FPS * 2)
+        target_frames = int(RECORD_TIME * ANIMATION_FPS * 1.2)
         orientations, positions = interpolate_motion(
             orientations, positions, target_frames
         )
@@ -401,7 +527,7 @@ class GameplayViewer(QWidget):
         mesh = pv.read(STL_FILE)
         mesh.translate(-np.array([0.15, 0, 0]))
         mesh.rotate_y(90)
-        mesh.scale([0.35, 0.35, 0.35])
+        mesh.scale([0.15, 0.15, 0.15])
 
         # -------- SAFE UI SETUP --------
         def setup_scene():
@@ -513,6 +639,15 @@ class GameplayViewer(QWidget):
             QMessageBox.warning(self, "File Not Found", f"Video file not found:\n{video_path}")
             return
         
+        # Check if this video is already being played
+        for window in self.video_windows:
+            if window.windowTitle().endswith(os.path.basename(video_path)):
+                QMessageBox.information(self, "Video Already Playing", 
+                                      f"'{os.path.basename(video_path)}' is already playing in another window.")
+                window.raise_()
+                window.activateWindow()
+                return
+        
         # Create video window
         video_window = QWidget()
         video_window.setWindowTitle(f"Video Player - {os.path.basename(video_path)}")
@@ -529,11 +664,15 @@ class GameplayViewer(QWidget):
         control_layout = QHBoxLayout()
         
         play_btn = QPushButton("Play")
+        pause_btn = QPushButton("Pause")
         stop_btn = QPushButton("Stop")
+        speed_btn = QPushButton("4x Speed")  # Updated default
         fullscreen_btn = QPushButton("Full Screen")
         
         control_layout.addWidget(play_btn)
+        control_layout.addWidget(pause_btn)
         control_layout.addWidget(stop_btn)
+        control_layout.addWidget(speed_btn)
         control_layout.addWidget(fullscreen_btn)
         control_layout.addStretch()
         
@@ -542,17 +681,29 @@ class GameplayViewer(QWidget):
         # Video player state
         class VideoPlayer:
             def __init__(self):
-                self.cap = cv2.VideoCapture(video_path)
-                if not self.cap.isOpened():
-                    raise Exception(f"Cannot open video: {video_path}")
+                with opencv_lock:
+                    self.cap = cv2.VideoCapture(video_path)
+                    if not self.cap.isOpened():
+                        raise Exception(f"Cannot open video: {video_path}")
                 
                 self.fps = self.cap.get(cv2.CAP_PROP_FPS)
                 self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-                self.frame_delay = max(1, int(1000 / self.fps)) if self.fps > 0 else 33
+                self.base_frame_delay = max(1, int(1000 / self.fps)) if self.fps > 0 else 33
+                self.speed_multiplier = 2.0  # Start at 2x speed instead of 1x
+                self.frame_delay = int(self.base_frame_delay / self.speed_multiplier)
                 self.is_playing = False
                 self.current_frame = 0
                 self.playback_thread = None
                 self.should_stop = False
+            
+            def set_speed(self, multiplier):
+                self.speed_multiplier = multiplier
+                self.frame_delay = max(1, int(self.base_frame_delay / self.speed_multiplier))
+            
+            def release(self):
+                with opencv_lock:
+                    if self.cap.isOpened():
+                        self.cap.release()
         
         try:
             player = VideoPlayer()
@@ -561,26 +712,27 @@ class GameplayViewer(QWidget):
             return
         
         def show_frame(frame_num):
-            player.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
-            ret, frame = player.cap.read()
-            
-            if not ret:
-                return
-            
-            # Convert BGR to RGB
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
-            
-            # Convert to QImage
-            bytes_per_line = 3 * w
-            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
-            
-            # Scale to fit label
-            pixmap = QPixmap.fromImage(qt_image)
-            scaled_pixmap = pixmap.scaledToWidth(video_label.width() - 20, Qt.SmoothTransformation)
-            video_label.setPixmap(scaled_pixmap)
-            
-            player.current_frame = frame_num
+            with opencv_lock:
+                player.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+                ret, frame = player.cap.read()
+                
+                if not ret:
+                    return
+                
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                h, w, ch = frame_rgb.shape
+                
+                # Convert to QImage
+                bytes_per_line = 3 * w
+                qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+                
+                # Scale to fit label
+                pixmap = QPixmap.fromImage(qt_image)
+                scaled_pixmap = pixmap.scaledToWidth(video_label.width() - 20, Qt.SmoothTransformation)
+                video_label.setPixmap(scaled_pixmap)
+                
+                player.current_frame = frame_num
         
         def play_video_thread():
             """Thread function for video playback"""
@@ -593,11 +745,13 @@ class GameplayViewer(QWidget):
                 else:
                     player.is_playing = False
                     play_btn.setText("Play")
+                    pause_btn.setText("Pause")
         
         def play_video():
             if not player.is_playing:
                 player.is_playing = True
-                play_btn.setText("Pause")
+                play_btn.setText("Playing")
+                pause_btn.setText("Pause")
                 player.playback_thread = threading.Thread(target=play_video_thread, daemon=True)
                 player.playback_thread.start()
         
@@ -605,6 +759,7 @@ class GameplayViewer(QWidget):
             if player.is_playing:
                 player.is_playing = False
                 play_btn.setText("Play")
+                pause_btn.setText("Paused")
         
         def toggle_play():
             if player.is_playing:
@@ -616,6 +771,19 @@ class GameplayViewer(QWidget):
             pause_video()
             player.current_frame = 0
             show_frame(0)
+            play_btn.setText("Play")
+            pause_btn.setText("Pause")
+        
+        def toggle_speed():
+            if player.speed_multiplier == 2.0:
+                player.set_speed(4.0)
+                speed_btn.setText("8x Speed")
+            elif player.speed_multiplier == 4.0:
+                player.set_speed(8.0)
+                speed_btn.setText("1x Speed")
+            else:  # 8.0
+                player.set_speed(1.0)
+                speed_btn.setText("2x Speed")
         
         def toggle_fullscreen():
             if video_window.isFullScreen():
@@ -627,14 +795,16 @@ class GameplayViewer(QWidget):
         
         # Connect buttons
         play_btn.clicked.connect(toggle_play)
+        pause_btn.clicked.connect(pause_video)
         stop_btn.clicked.connect(stop_video)
+        speed_btn.clicked.connect(toggle_speed)
         fullscreen_btn.clicked.connect(toggle_fullscreen)
         
         # Cleanup when window closes
         def cleanup():
             player.should_stop = True
             player.is_playing = False
-            player.cap.release()
+            player.release()
             if video_window in self.video_windows:
                 self.video_windows.remove(video_window)
         
@@ -659,7 +829,7 @@ DEVICE_NAME = "Nano33BLE_IMU"
 CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
 
 RECORD_TIME = 10
-ANIMATION_FPS = 120
+ANIMATION_FPS = 60  # Increased from 120 for faster playback
 SMOOTH_WINDOW = 50
 
 TRANSLATION_SCALE = 0.1
