@@ -1,0 +1,987 @@
+import os
+import sys
+
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QStackedWidget, QMessageBox, QFileDialog,
+    QListWidget, QListWidgetItem, QInputDialog
+)
+from PyQt5.QtGui import QPixmap, QFont, QImage
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+import cv2
+
+import pyvista as pv
+from pyvistaqt import QtInteractor
+
+from PyQt5.QtWidgets import QLineEdit
+from PyQt5.QtCore import QTimer
+import threading
+import asyncio
+
+import time
+import numpy as np
+import imageio
+from bleak import BleakScanner, BleakClient
+from scipy.signal import savgol_filter
+from scipy.interpolate import CubicSpline
+from scipy.spatial.transform import Rotation as R, Slerp
+
+# ---------------- CONSTANTS ----------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = BASE_DIR  # for assets
+
+# ---------------- WORKER THREAD ----------------
+class RecordingWorker(QThread):
+    """Worker thread for BLE recording and animation"""
+    status_update = pyqtSignal(str)  # Status messages
+    finished = pyqtSignal(str)  # Video path when done
+    error = pyqtSignal(str)  # Error messages
+
+    def __init__(self, video_path):
+        super().__init__()
+        self.video_path = video_path
+
+    def run(self):
+        """Run the recording and animation pipeline"""
+        try:
+            self.status_update.emit("🔄 Starting recording...")
+            
+            # Run async recording
+            try:
+                asyncio.run(self._async_pipeline())
+            except RuntimeError:
+                # Handle event loop issues
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(self._async_pipeline())
+                loop.close()
+
+        except Exception as e:
+            self.status_update.emit(f"[!] Error: {e}")
+            import traceback
+            self.status_update.emit(traceback.format_exc())
+            self.error.emit(str(e))
+
+    async def _async_pipeline(self):
+        """Async pipeline implementation"""
+        # Record motion
+        await record_motion()
+
+        if len(ax_data) < 5:
+            self.status_update.emit("❌ Not enough data")
+            self.error.emit("Not enough motion data recorded")
+            return
+        if len(ax_data) == 0:
+            self.status_update.emit("❌ Device not found")
+            self.error.emit("BLE device not found")
+            return
+
+        self.status_update.emit(f"[✓] Recorded {len(ax_data)} samples")
+
+        # Process data
+        ax, ay, az, gx, gy, gz = resample_data(
+            ax_data, ay_data, az_data, gx_data, gy_data, gz_data
+        )
+
+        orientations = compute_orientation(ax, ay, az, gx, gy, gz)
+        positions = compute_swing_translation(orientations, ax, ay, az)
+
+        target_frames = int(RECORD_TIME * ANIMATION_FPS * 2)
+        orientations, positions = interpolate_motion(
+            orientations, positions, target_frames
+        )
+
+        self.status_update.emit("[*] Creating animation...")
+
+        # Create animation (this part is synchronous)
+        self._create_animation(orientations, positions)
+
+        self.status_update.emit("✅ Animation complete!")
+        self.finished.emit(self.video_path)
+
+    def _create_animation(self, orientations, positions):
+        """Create the animation synchronously"""
+        mesh = pv.read(STL_FILE)
+        mesh.translate(-np.array([0.15, 0, 0]))
+        mesh.rotate_y(90)
+        mesh.scale([0.35, 0.35, 0.35])
+
+        plotter = pv.Plotter(off_screen=True, window_size=(1024, 768))
+        actor = plotter.add_mesh(mesh, color="darkgreen", smooth_shading=True)
+        plotter.add_axes()
+        plotter.set_background("white")
+        plotter.show(auto_close=False)
+
+        writer = imageio.get_writer(self.video_path, fps=ANIMATION_FPS)
+
+        prev_rot = None
+
+        for i, (orientation, pos) in enumerate(zip(orientations, positions)):
+            rot = orientation.as_euler("xyz", degrees=True)
+            if prev_rot is not None:
+                rot = prev_rot * 0.7 + np.array(rot) * 0.3
+            prev_rot = rot
+
+            actor.SetOrientation(rot)
+            actor.SetPosition(pos)
+            plotter.render()
+            frame = plotter.screenshot(return_img=True)
+            writer.append_data(frame)
+
+            if i % 50 == 0:
+                progress = (i / len(orientations)) * 100
+                self.status_update.emit(f"[*] Rendering: {progress:.1f}%")
+
+        writer.close()
+        plotter.close()
+
+# ---------------- PADDLE VIEWER ----------------
+class PaddleViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.plotter = QtInteractor(self)
+
+        main = QVBoxLayout(self)
+        main.addWidget(self.plotter.interactor)
+
+        bar = QHBoxLayout()
+        self.back_btn = QPushButton("Back")
+        bar.addWidget(self.back_btn)
+        bar.addStretch()
+        main.addLayout(bar)
+
+    def load_default(self):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "paddle.stl")
+
+        if not os.path.exists(path):
+            QMessageBox.warning(self, "Missing file", f"Could not find paddle.stl in {script_dir}")
+            self.plotter.clear()
+            self.plotter.add_axes()
+            self.plotter.add_mesh(pv.Cube(), color="gray", opacity=0.4)
+            self.plotter.reset_camera()
+            return
+
+        try:
+            mesh = pv.read(path)
+            self.plotter.clear()
+            self.plotter.add_axes()
+            self.plotter.add_mesh(mesh, show_edges=False, smooth_shading=True, color="darkgreen")
+            self.plotter.reset_camera()
+            self.plotter.view_isometric()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load STL:\n{e}")
+
+
+# ---------------- GAMEPLAY VIEWER ----------------
+class GameplayViewer(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+
+        self.plotter = QtInteractor(self)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.plotter.interactor)
+
+        # -------- CONTROLS --------
+        controls = QHBoxLayout()
+
+        self.name_input = QLineEdit()
+        self.name_input.setPlaceholderText("Enter video name")
+
+        self.start_btn = QPushButton("Start Recording")
+        self.watch_btn = QPushButton("Watch Video")
+
+        controls.addWidget(self.name_input)
+        controls.addWidget(self.start_btn)
+        controls.addWidget(self.watch_btn)
+
+        layout.addLayout(controls)
+
+        self.status_label = QLabel("Ready")
+        layout.addWidget(self.status_label)
+
+        # Back button
+        bar = QHBoxLayout()
+        self.back_btn = QPushButton("Back")
+        bar.addWidget(self.back_btn)
+        bar.addStretch()
+        layout.addLayout(bar)
+
+        self.start_btn.clicked.connect(self.start_gameplay)
+        self.watch_btn.clicked.connect(self.browse_and_play_video)
+
+        # Add video list panel to left side
+        left_panel = QVBoxLayout()
+        
+        file_label = QLabel("Recent Videos:")
+        file_label.setFont(QFont("Arial", 10, QFont.Bold))
+        left_panel.addWidget(file_label)
+        
+        self.video_list = QListWidget()
+        self.video_list.itemDoubleClicked.connect(self.play_selected_video)
+        left_panel.addWidget(self.video_list)
+        
+        refresh_btn = QPushButton("Refresh List")
+        refresh_btn.clicked.connect(self.refresh_video_list)
+        left_panel.addWidget(refresh_btn)
+        
+        # Insert left panel into layout
+        left_container = QWidget()
+        left_container.setLayout(left_panel)
+        left_container.setMaximumWidth(220)
+        layout.insertWidget(0, left_container)
+        
+        self.video_path = None
+        self.worker = None
+        
+        # Load initial video list
+        self.refresh_video_list()
+
+    # -------- START --------
+    def start_gameplay(self):
+        if self.worker and self.worker.isRunning():
+            return
+
+        name = self.name_input.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Error", "Enter a video name")
+            return
+
+        self.video_path = os.path.join(SCRIPT_DIR, f"{name}.mp4")
+
+        # Clear old data
+        ax_data.clear(); ay_data.clear(); az_data.clear()
+        gx_data.clear(); gy_data.clear(); gz_data.clear()
+
+        # Create and start worker
+        self.worker = RecordingWorker(self.video_path)
+        self.worker.status_update.connect(self.update_status)
+        self.worker.finished.connect(self.on_recording_finished)
+        self.worker.error.connect(self.on_recording_error)
+        self.worker.start()
+
+    def update_status(self, message):
+        """Update status label"""
+        self.status_label.setText(message)
+
+    def on_recording_finished(self, video_path):
+        """Called when recording completes"""
+        # Prompt user for filename
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"paddle_swing_{timestamp}.mp4"
+        
+        filename, ok = QInputDialog.getText(
+            self,
+            "Save Video As",
+            f"Enter video filename (default: {default_name}):",
+            text=default_name
+        )
+        
+        if ok and filename:
+            # Ensure .mp4 extension
+            if not filename.endswith('.mp4'):
+                filename += '.mp4'
+            
+            new_path = os.path.join(SCRIPT_DIR, filename)
+            
+            try:
+                os.rename(video_path, new_path)
+                self.video_path = new_path
+                QMessageBox.information(self, "Saved", f"Video saved as:\n{filename}")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not rename file:\n{e}")
+        
+        # Refresh video list
+        self.refresh_video_list()
+
+    def on_recording_error(self, error_msg):
+        """Called when recording fails"""
+        QMessageBox.critical(self, "Recording Error", error_msg)
+
+    def refresh_video_list(self):
+        """Refresh the list of available videos"""
+        self.video_list.clear()
+        if os.path.exists(SCRIPT_DIR):
+            for file in os.listdir(SCRIPT_DIR):
+                if file.endswith('.mp4'):
+                    self.video_list.addItem(file)
+
+    def play_selected_video(self, item):
+        """Play the selected video from the list"""
+        if item:
+            video_name = item.text()
+            video_path = os.path.join(SCRIPT_DIR, video_name)
+            if os.path.exists(video_path):
+                self.play_video(video_path)
+            else:
+                QMessageBox.warning(self, "File Not Found", f"Could not find video:\n{video_name}")
+
+    def browse_and_play_video(self):
+        """Browse for and play a video file"""
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            SCRIPT_DIR,
+            "Video Files (*.mp4 *.avi *.mov)"
+        )
+        if filename:
+            self.play_video(filename)
+
+    def play_video(self, video_path):
+        """Play a video file using OpenCV"""
+        try:
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                QMessageBox.critical(self, "Error", "Could not open video file")
+                return
+
+            # Create a window for video playback
+            cv2.namedWindow("Paddle Swing Video", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Paddle Swing Video", 800, 600)
+
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break
+
+                cv2.imshow("Paddle Swing Video", frame)
+                
+                # Exit on 'q' key or window close
+                if cv2.waitKey(25) & 0xFF == ord('q'):
+                    break
+                if cv2.getWindowProperty("Paddle Swing Video", cv2.WND_PROP_VISIBLE) < 1:
+                    break
+
+            cap.release()
+            cv2.destroyAllWindows()
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to play video:\n{e}")
+
+    # -------- COUNTDOWN --------
+    def countdown(self, t):
+        if t > 0:
+            self.status_label.setText(f"⏳ Recording starts in {t}...")
+            QTimer.singleShot(1000, lambda: self.countdown(t-1))
+        else:
+            self.status_label.setText("🔴 Recording NOW")
+            threading.Thread(target=self.run_pipeline, daemon=True).start()
+
+    # -------- PIPELINE --------
+    def run_pipeline(self):
+        asyncio.run(self.pipeline())
+
+    async def pipeline(self):
+
+        await record_motion()
+
+        if len(ax_data) < 5:
+            QTimer.singleShot(0, lambda: self.status_label.setText("❌ Not enough data"))
+            self.running = False
+            return
+        if len(ax_data) == 0:
+            QTimer.singleShot(0, lambda: self.status_label.setText("❌ Device not found"))
+            self.running = False
+            return
+
+        ax, ay, az, gx, gy, gz = resample_data(
+            ax_data, ay_data, az_data, gx_data, gy_data, gz_data
+        )
+
+        orientations = compute_orientation(ax, ay, az, gx, gy, gz)
+        positions = compute_swing_translation(orientations, ax, ay, az)
+
+        target_frames = int(RECORD_TIME * ANIMATION_FPS * 2)
+        orientations, positions = interpolate_motion(
+            orientations, positions, target_frames
+        )
+
+        mesh = pv.read(STL_FILE)
+        mesh.translate(-np.array([0.15, 0, 0]))
+        mesh.rotate_y(90)
+        mesh.scale([0.35, 0.35, 0.35])
+
+        # -------- SAFE UI SETUP --------
+        def setup_scene():
+            self.plotter.clear()
+            self.plotter.add_axes()
+            self.actor = self.plotter.add_mesh(
+                mesh, color="darkgreen", smooth_shading=True
+            )
+            self.plotter.reset_camera()
+
+        QTimer.singleShot(0, setup_scene)
+
+        writer = imageio.get_writer(self.video_path, fps=ANIMATION_FPS)
+
+        prev_rot = None
+
+        for orientation, pos in zip(orientations, positions):
+
+            rot = orientation.as_euler("xyz", degrees=True)
+            if prev_rot is not None:
+                rot = prev_rot * 0.7 + np.array(rot) * 0.3
+            prev_rot = rot
+
+            # -------- SAFE FRAME UPDATE --------
+            def update_frame(rot=rot, pos=pos):
+                try:
+                    self.actor.SetOrientation(rot)
+                    self.actor.SetPosition(pos)
+                    self.plotter.render()
+                    frame = self.plotter.screenshot(return_img=True)
+                    writer.append_data(frame)
+                except:
+                    pass
+
+            QTimer.singleShot(0, update_frame)
+            QTimer.singleShot(int(1000 / ANIMATION_FPS), lambda: None)
+
+        writer.close()
+
+        def finish():
+            self.status_label.setText("✅ Done!")
+            
+            # Show dialog with options to open or browse
+            result = QMessageBox.question(
+                self,
+                "Video Saved",
+                f"Video saved to:\n{self.video_path}\n\nWhat would you like to do?",
+                QMessageBox.Open | QMessageBox.Cancel
+            )
+            
+            if result == QMessageBox.Open:
+                os.startfile(self.video_path)
+
+        QTimer.singleShot(0, finish)
+
+        self.running = False
+
+    # -------- VIDEO LIST MANAGEMENT --------
+    def refresh_video_list(self):
+        """Scan folder for MP4 files and populate list"""
+        self.video_list.clear()
+        
+        # Get all MP4 files in script directory
+        video_files = []
+        try:
+            for file in os.listdir(SCRIPT_DIR):
+                if file.lower().endswith('.mp4'):
+                    video_files.append(file)
+        except Exception as e:
+            print(f"[!] Error scanning directory: {e}")
+        
+        # Sort by modification time (newest first)
+        video_files.sort(key=lambda x: os.path.getmtime(os.path.join(SCRIPT_DIR, x)), reverse=True)
+        
+        # Add to list widget
+        for video_file in video_files:
+            item = QListWidgetItem(video_file)
+            item.setData(Qt.UserRole, os.path.join(SCRIPT_DIR, video_file))
+            self.video_list.addItem(item)
+        
+        if video_files:
+            self.video_list.setCurrentRow(0)
+    
+    def browse_and_play_video(self):
+        """Browse and play any video file"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File",
+            SCRIPT_DIR,
+            "MP4 Videos (*.mp4);;All Files (*)"
+        )
+        
+        if file_path and os.path.exists(file_path):
+            self.play_video_opencv(file_path)
+    
+    def play_selected_video(self):
+        """Play the selected video from the list"""
+        current_item = self.video_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "No Selection", "Please select a video to play.")
+            return
+        
+        video_path = current_item.data(Qt.UserRole)
+        self.play_video_opencv(video_path)
+    
+    def play_video_opencv(self, video_path):
+        """Play video using OpenCV in a new window"""
+        if not os.path.exists(video_path):
+            QMessageBox.warning(self, "File Not Found", f"Video file not found:\n{video_path}")
+            return
+        
+        # Create video window
+        video_window = QWidget()
+        video_window.setWindowTitle(f"Video Player - {os.path.basename(video_path)}")
+        video_window.resize(960, 720)
+        
+        layout = QVBoxLayout(video_window)
+        
+        # Video display label
+        video_label = QLabel()
+        video_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(video_label)
+        
+        # Control buttons
+        control_layout = QHBoxLayout()
+        
+        play_btn = QPushButton("Play")
+        stop_btn = QPushButton("Stop")
+        fullscreen_btn = QPushButton("Full Screen")
+        
+        control_layout.addWidget(play_btn)
+        control_layout.addWidget(stop_btn)
+        control_layout.addWidget(fullscreen_btn)
+        control_layout.addStretch()
+        
+        layout.addLayout(control_layout)
+        
+        # Video player state
+        class VideoPlayer:
+            def __init__(self):
+                self.cap = cv2.VideoCapture(video_path)
+                if not self.cap.isOpened():
+                    raise Exception(f"Cannot open video: {video_path}")
+                
+                self.fps = self.cap.get(cv2.CAP_PROP_FPS)
+                self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                self.frame_delay = max(1, int(1000 / self.fps)) if self.fps > 0 else 33
+                self.is_playing = False
+                self.current_frame = 0
+                self.playback_thread = None
+                self.should_stop = False
+        
+        try:
+            player = VideoPlayer()
+        except Exception as e:
+            QMessageBox.critical(self, "Video Error", f"Cannot open video:\n{str(e)}")
+            return
+        
+        def show_frame(frame_num):
+            player.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_num)
+            ret, frame = player.cap.read()
+            
+            if not ret:
+                return
+            
+            # Convert BGR to RGB
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            h, w, ch = frame_rgb.shape
+            
+            # Convert to QImage
+            bytes_per_line = 3 * w
+            qt_image = QImage(frame_rgb.data, w, h, bytes_per_line, QImage.Format_RGB888)
+            
+            # Scale to fit label
+            pixmap = QPixmap.fromImage(qt_image)
+            scaled_pixmap = pixmap.scaledToWidth(video_label.width() - 20, Qt.SmoothTransformation)
+            video_label.setPixmap(scaled_pixmap)
+            
+            player.current_frame = frame_num
+        
+        def play_video_thread():
+            """Thread function for video playback"""
+            import time
+            while player.is_playing and not player.should_stop:
+                if player.current_frame < player.total_frames - 1:
+                    player.current_frame += 1
+                    show_frame(player.current_frame)
+                    time.sleep(player.frame_delay / 1000.0)
+                else:
+                    player.is_playing = False
+                    play_btn.setText("Play")
+        
+        def play_video():
+            if not player.is_playing:
+                player.is_playing = True
+                play_btn.setText("Pause")
+                player.playback_thread = threading.Thread(target=play_video_thread, daemon=True)
+                player.playback_thread.start()
+        
+        def pause_video():
+            if player.is_playing:
+                player.is_playing = False
+                play_btn.setText("Play")
+        
+        def toggle_play():
+            if player.is_playing:
+                pause_video()
+            else:
+                play_video()
+        
+        def stop_video():
+            pause_video()
+            player.current_frame = 0
+            show_frame(0)
+        
+        def toggle_fullscreen():
+            if video_window.isFullScreen():
+                video_window.showNormal()
+                fullscreen_btn.setText("Full Screen")
+            else:
+                video_window.showFullScreen()
+                fullscreen_btn.setText("Exit Full Screen")
+        
+        # Connect buttons
+        play_btn.clicked.connect(toggle_play)
+        stop_btn.clicked.connect(stop_video)
+        fullscreen_btn.clicked.connect(toggle_fullscreen)
+        
+        # Cleanup when window closes
+        def cleanup():
+            player.should_stop = True
+            player.is_playing = False
+            player.cap.release()
+            if video_window in self.video_windows:
+                self.video_windows.remove(video_window)
+        
+        video_window.destroyed.connect(cleanup)
+        self.video_windows.append(video_window)
+        
+        # Show first frame and window
+        show_frame(0)
+        video_window.show()
+
+# ---------------- CONFIG ----------------
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+VIDEO_DIR = os.path.join(BASE_DIR, "videos")
+os.makedirs(VIDEO_DIR, exist_ok=True)
+
+SCRIPT_DIR = BASE_DIR  # for assets
+
+STL_FILE = os.path.join(BASE_DIR, "paddle.stl")
+
+DEVICE_NAME = "Nano33BLE_IMU"
+CHAR_UUID = "19B10001-E8F2-537E-4F6C-D104768A1214"
+
+RECORD_TIME = 10
+ANIMATION_FPS = 120
+SMOOTH_WINDOW = 50
+
+TRANSLATION_SCALE = 0.1
+GYRO_WEIGHT = 0.8
+
+# ---------------- DATA STORAGE ----------------
+ax_data, ay_data, az_data = [], [], []
+gx_data, gy_data, gz_data = [], [], []
+
+# ---------------- BLE RECORDING ----------------
+async def record_motion():
+
+    print("Scanning for device...")
+    devices = await BleakScanner.discover()
+    device = next((d for d in devices if d.name == DEVICE_NAME), None)
+
+    if not device:
+        print("Device not found")
+        return
+
+    print("Connecting to", device.address)
+
+    async with BleakClient(device.address) as client:
+
+        def notification_handler(sender, data):
+
+            try:
+                #text = data.decode().strip()
+                #vals = text.replace(",", " ").split()
+                vals = np.frombuffer(data, dtype=np.float32)
+
+                if len(vals) < 6:
+                    return
+
+                ax, ay, az, gx, gy, gz = vals
+
+                ax_data.append(ax)
+                ay_data.append(ay)
+                az_data.append(az)
+
+                gx_data.append(gx)
+                gy_data.append(gy)
+                gz_data.append(gz)
+
+            except:
+                pass
+
+        print("Recording Motion...")
+        await client.start_notify(CHAR_UUID, notification_handler)
+
+        await asyncio.sleep(RECORD_TIME)
+
+        await client.stop_notify(CHAR_UUID)
+
+    print("Recording finished")
+    print("Samples captured:", len(ax_data))
+    print("Sample rate:", len(ax_data) / RECORD_TIME, "Hz")
+
+# ---------------- SMOOTH ----------------
+def smooth_data(data):
+
+    if len(data) < SMOOTH_WINDOW:
+        return np.array(data)
+
+    return savgol_filter(data, SMOOTH_WINDOW, 3)
+
+# ---------------- RESAMPLE DATA ----------------
+def resample_data(ax, ay, az, gx, gy, gz, target_rate=200):
+    ts = np.arange(len(ax)) / (len(ax) / RECORD_TIME)
+    t_uniform = np.arange(ts[0], ts[-1], 1.0 / target_rate)
+    
+    cs_ax = CubicSpline(ts, ax)
+    cs_ay = CubicSpline(ts, ay)
+    cs_az = CubicSpline(ts, az)
+    cs_gx = CubicSpline(ts, gx)
+    cs_gy = CubicSpline(ts, gy)
+    cs_gz = CubicSpline(ts, gz)
+    
+    ax_u = cs_ax(t_uniform)
+    ay_u = cs_ay(t_uniform)
+    az_u = cs_az(t_uniform)
+    gx_u = cs_gx(t_uniform)
+    gy_u = cs_gy(t_uniform)
+    gz_u = cs_gz(t_uniform)
+    
+    return ax_u, ay_u, az_u, gx_u, gy_u, gz_u
+
+# ---------------- ORIENTATION ----------------
+def compute_orientation(ax, ay, az, gx, gy, gz):
+
+    ax = smooth_data(ax)
+    ay = smooth_data(ay)
+    az = smooth_data(az)
+
+    gx = smooth_data(gx)
+    gy = smooth_data(gy)
+    gz = smooth_data(gz)
+
+    orientations = []
+    orientation = R.identity()
+
+    dt = RECORD_TIME/(len(ax))
+
+    for i in range(len(ax)):
+
+        gyro_vec = np.array([gx[i], gy[i], gz[i]]) * np.pi/180 * dt
+        gyro_rot = R.from_rotvec(gyro_vec)
+
+        orientation = orientation * gyro_rot
+
+        g = np.array([ax[i], ay[i], az[i]])
+        norm = np.linalg.norm(g)
+        if norm == 0:
+            continue
+        g /= norm
+
+        pitch = np.arctan2(-g[0], np.sqrt(g[1]**2 + g[2]**2))
+        roll = np.arctan2(g[1], g[2])
+
+        accel_rot = R.from_euler('xy', [pitch, roll])
+
+        key_times = [0,1]
+        key_rots = R.concatenate([orientation, accel_rot])
+
+        slerp = Slerp(key_times, key_rots)
+        orientation = slerp([GYRO_WEIGHT])[0]
+
+        orientations.append(orientation)
+
+    base = orientations[0].inv()
+    orientations = [base * o for o in orientations]
+
+    return orientations
+
+# ---------------- TRANSLATION ----------------
+def compute_swing_translation(orientations, ax, ay, az):
+
+    dt = RECORD_TIME / len(ax)
+
+    velocity = np.zeros(3)
+    position = np.zeros(3)
+
+    positions = []
+
+    for i in range(len(ax)):
+
+        acc_body = np.array([ax[i], ay[i], az[i]])
+
+        # convert to world frame
+        acc_world = orientations[i].apply(acc_body)
+
+        # remove gravity (approx)
+        acc_world[2] -= 1.0
+
+        velocity += acc_world * dt
+        position += velocity * dt
+
+        positions.append(position.copy())
+
+    positions = np.array(positions)
+
+    # smooth result
+    for i in range(3):
+        positions[:, i] = savgol_filter(positions[:, i], 21, 3)
+
+    # Scale down translation for paddle swing
+    positions *= TRANSLATION_SCALE
+
+    return positions
+
+# -------- INTERPOLATE FOR SMOOTHER MOTION --------
+def interpolate_motion(orientations, positions, target_frames):
+
+    n_keyframes = len(orientations)
+
+    if n_keyframes < 4:
+        return orientations, positions
+
+    time_original = np.linspace(0, 1, n_keyframes)
+    time_interp = np.linspace(0, 1, target_frames)
+
+    # -------- ORIENTATION INTERPOLATION (SLERP) --------
+    key_rots = R.concatenate(orientations)
+    slerp = Slerp(time_original, key_rots)
+    interp_orientations = slerp(time_interp)
+
+    # -------- POSITION INTERPOLATION --------
+    interp_positions = np.zeros((target_frames, 3))
+
+    for i in range(3):
+        cs = CubicSpline(time_original, positions[:, i])
+        interp_positions[:, i] = cs(time_interp)
+
+    return list(interp_orientations), interp_positions
+# -------- ANIMATION --------
+def animate_paddle():
+    if len(ax_data) < 5:
+        print("Not enough motion data")
+        return
+
+    # Resample data
+    ax, ay, az, gx, gy, gz = resample_data(ax_data, ay_data, az_data, gx_data, gy_data, gz_data)
+
+    # compute orientation and positions
+    orientations = compute_orientation(ax, ay, az, gx, gy, gz)
+    positions = compute_swing_translation(orientations, ax, ay, az)
+    path = pv.Spline(positions, 200)
+    
+    # Interpolate for smoother motion (slow motion effect)
+    slow_motion_factor = 2  # Increase for slower playback (e.g., 2 = half speed)
+    target_frames = int(RECORD_TIME * ANIMATION_FPS * slow_motion_factor)  # More frames for slower animation
+    print(f"Interpolating from {len(orientations)} frames to {target_frames} frames...")
+    orientations, positions = interpolate_motion(orientations, positions, target_frames)
+
+    # read paddle mesh
+    mesh = pv.read(STL_FILE)
+    #mesh.translate(-np.array(mesh.center))
+    handle_offset = np.array([0.15, 0, 0])  # adjust based on actual model    
+    mesh.translate(-handle_offset)
+    mesh.rotate_y(90)
+
+    # scale paddle for visibility
+    mesh.scale([0.35, 0.35, 0.35])
+
+    plotter = pv.Plotter(off_screen=True, window_size=(912, 704))
+    actor = plotter.add_mesh(
+        mesh,
+        color="darkgreen",
+        smooth_shading=True
+    )
+    plotter.set_background("white")
+    #plotter.add_mesh(path, color="red", line_width=4)
+    plotter.add_axes()
+
+# ---------------- MAIN WINDOW ----------------
+class NexshotMain(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Nexshot")
+        self.resize(1000, 700)
+
+        self.stack = QStackedWidget()
+        self.setCentralWidget(self.stack)
+
+        self._build_welcome()
+        self._build_paddle()
+        self._build_gameplay()
+
+    # -------- Welcome Page --------
+    def _build_welcome(self):
+        w = QWidget()
+        v = QVBoxLayout(w)
+        v.setContentsMargins(20, 20, 20, 20)
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        icon_path = os.path.join(script_dir, "nexshot_icon.png")
+
+        if os.path.exists(icon_path):
+            pix = QPixmap(icon_path).scaledToWidth(360)
+            img = QLabel()
+            img.setPixmap(pix)
+            img.setAlignment(Qt.AlignCenter)
+            v.addWidget(img, alignment=Qt.AlignCenter)
+        else:
+            placeholder = QLabel("[no icon available]")
+            placeholder.setAlignment(Qt.AlignCenter)
+            v.addWidget(placeholder, alignment=Qt.AlignCenter)
+
+        title = QLabel("Welcome to Nexshot")
+        title.setFont(QFont("Arial", 28))
+        title.setAlignment(Qt.AlignCenter)
+        v.addWidget(title, alignment=Qt.AlignCenter)
+
+        v.addStretch()
+
+        btn_row = QHBoxLayout()
+        self.game_btn = QPushButton("Gameplay")
+        self.paddle_btn = QPushButton("Our Paddle")
+
+        btn_row.addStretch()
+        btn_row.addWidget(self.game_btn)
+        btn_row.addWidget(self.paddle_btn)
+        btn_row.addStretch()
+
+        v.addLayout(btn_row)
+
+        self.game_btn.clicked.connect(self._show_gameplay)
+        self.paddle_btn.clicked.connect(self._show_paddle)
+
+        self.stack.addWidget(w)
+
+    # -------- Paddle Page --------
+    def _build_paddle(self):
+        self.paddle_page = PaddleViewer()
+        self.paddle_page.back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.stack.addWidget(self.paddle_page)
+
+    # -------- Gameplay Page --------
+    def _build_gameplay(self):
+        self.gameplay_page = GameplayViewer()
+        self.gameplay_page.back_btn.clicked.connect(lambda: self.stack.setCurrentIndex(0))
+        self.stack.addWidget(self.gameplay_page)
+
+    # -------- Navigation --------
+    def _show_gameplay(self):
+        self.stack.setCurrentWidget(self.gameplay_page)
+
+    def _show_paddle(self):
+        self.stack.setCurrentWidget(self.paddle_page)
+        try:
+            self.paddle_page.load_default()
+        except Exception:
+            pass
+
+
+# ---------------- RUN APP ----------------
+def main():
+    app = QApplication(sys.argv)
+    win = NexshotMain()
+    win.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
