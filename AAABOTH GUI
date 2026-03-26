@@ -103,6 +103,15 @@ class RecordingWorker(QThread):
         orientations = compute_orientation(ax, ay, az, gx, gy, gz)
         positions = compute_swing_translation(orientations, ax, ay, az)
 
+        if self.mode == "SERIAL":
+            positions = positions - np.mean(positions, axis=0)  # Center around origin for serial mode
+
+            max_range = np.max(np.linalg.norm(positions, axis=1))
+            if max_range > 0:
+                positions = positions / max_range * 0.2  # Scale to fit in view
+
+            positions *= 0.5  # Additional scaling for serial mode
+
         target_frames = int(RECORD_TIME * ANIMATION_FPS * 1.2)  # Reduced from 2x to 1.2x for faster videos
         orientations, positions = interpolate_motion(
             orientations, positions, target_frames
@@ -129,7 +138,10 @@ class RecordingWorker(QThread):
         handle_offset = np.array([0.15, 0, 0])
         mesh.translate(-handle_offset)
         mesh.rotate_y(90)
-        mesh.scale([1.0, 1.0, 1.0])
+        if self.mode == "SERIAL":
+            mesh.scale([0.35, 0.35, 0.35])
+        else:
+            mesh.scale([1.0, 1.0, 1.0])
         print(f"Mesh bounds after transform: {mesh.bounds}")
 
         plotter = pv.Plotter(off_screen=True, window_size=(912, 704))
@@ -148,7 +160,10 @@ class RecordingWorker(QThread):
         swing_size = np.linalg.norm(bounds_max - bounds_min)
         print(f"Total bounds min: {bounds_min}, max: {bounds_max}, center: {center}, swing_size: {swing_size}")
 
-        cam_dist = swing_size * 2.5 + 6
+        if self.mode == "SERIAL":
+            cam_dist = swing_size * 3 + 8  # Cap distance for serial mode
+        else:
+            cam_dist = swing_size * 2.5 + 6
         camera_pos = (
             center[0] + cam_dist,
             center[1] + cam_dist,
@@ -1064,35 +1079,30 @@ def record_motion_serial(status_callback=None):
 
     _status("Recording Motion (Serial)...")
     start_time = time.time()
+    buffer = b''
 
     while time.time() - start_time < RECORD_TIME:
 
-        data = ser.read(24)  # 6 floats × 4 bytes
+        chunk = ser.read(64)  # read up to 64 bytes
+        if chunk:      
+            buffer += chunk
 
-        #print(f"Serial received data: {data} (length: {len(data)})")  # Debug
+        while len(buffer) >= 24:  # we have at least one full sample
+            packet = buffer[:24]
+            buffer = buffer[24:]
 
-        if len(data) != 24:
-            print(f"Serial: wrong length {len(data)}, expected 24")
-            continue
+            vals = np.frombuffer(packet, dtype=np.float32)
 
-        vals = np.frombuffer(data, dtype=np.float32)
+            if len(vals) == 6:
+                ax, ay, az, gx, gy, gz = vals
 
-        if len(vals) != 6:
-            print(f"Serial: wrong number of floats {len(vals)}")
-            continue
+                ax_data.append(ax)
+                ay_data.append(ay)
+                az_data.append(az)
 
-        ax, ay, az, gx, gy, gz = vals
-
-        ax_data.append(ax)
-        ay_data.append(ay)
-        az_data.append(az)
-
-        gx_data.append(gx)
-        gy_data.append(gy)
-        gz_data.append(gz)
-
-        #print(f"Serial parsed: ax={ax}, ay={ay}, az={az}, gx={gx}, gy={gy}, gz={gz}")  # Debug
-
+                gx_data.append(gx)
+                gy_data.append(gy)
+                gz_data.append(gz)
     ser.close()
 
     _status("Recording finished (Serial)")
@@ -1247,6 +1257,7 @@ def animate_paddle():
     # compute orientation and positions
     orientations = compute_orientation(ax, ay, az, gx, gy, gz)
     positions = compute_swing_translation(orientations, ax, ay, az)
+
     path = pv.Spline(positions, 200)
     
     # Interpolate for smoother motion (slow motion effect)
