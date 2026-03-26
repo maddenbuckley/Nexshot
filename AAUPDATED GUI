@@ -117,7 +117,9 @@ class RecordingWorker(QThread):
         actor = plotter.add_mesh(mesh, color="darkgreen", smooth_shading=False)  # Disable smooth shading for speed
         plotter.add_axes(line_width=1)  # Simpler axes
         plotter.set_background("white")
-        plotter.show(auto_close=False)
+        # Avoid opening a UG render window when off-screen rendering.
+        # plotter.show() can trigger wglMakeCurrent with invalid handle in Win32.
+        # plotter.show(auto_close=False)
         plotter.reset_camera()  # Ensure the entire paddle is visible in the frame
 
         writer = imageio.get_writer(self.video_path, fps=ANIMATION_FPS, macro_block_size=16, 
@@ -246,12 +248,34 @@ class GameplayViewer(QWidget):
 
         # -------- CONTROLS --------
         controls = QHBoxLayout()
+        controls.setSpacing(12)
+        controls.setContentsMargins(8, 6, 8, 6)
 
         self.name_input = QLineEdit()
         self.name_input.setPlaceholderText("Enter video name")
+        self.name_input.setMaximumWidth(260)
+        self.name_input.setStyleSheet(
+            "QLineEdit { padding: 8px; border: 1px solid #ccc; border-radius: 6px; }"
+            "QLineEdit:focus { border-color: #4a90e2; }"
+        )
 
         self.start_btn = QPushButton("Start Recording")
+        self.start_btn.setCursor(Qt.PointingHandCursor)
+        self.start_btn.setMinimumHeight(30)
+        self.start_btn.setStyleSheet(
+            "QPushButton { background-color: #28a745; color: white; border: none; border-radius: 6px; padding: 6px 14px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #22963a; }"
+            "QPushButton:pressed { background-color: #1f7d33; }"
+        )
+
         self.clear_log_btn = QPushButton("Clear Log")
+        self.clear_log_btn.setCursor(Qt.PointingHandCursor)
+        self.clear_log_btn.setMinimumHeight(30)
+        self.clear_log_btn.setStyleSheet(
+            "QPushButton { background-color: #dc3545; color: white; border: none; border-radius: 6px; padding: 6px 14px; font-weight: bold; }"
+            "QPushButton:hover { background-color: #c82333; }"
+            "QPushButton:pressed { background-color: #b21f2d; }"
+        )
 
         controls.addWidget(self.name_input)
         controls.addWidget(self.start_btn)
@@ -261,15 +285,7 @@ class GameplayViewer(QWidget):
 
         self.clear_log_btn.clicked.connect(self.clear_status_log)
 
-        self.status_label = QLabel("Ready")
-        self.status_label.setStyleSheet("font-size: 14px; color: #333; padding: 3px;")
-        layout.addWidget(self.status_label)
-
-        # Status history log list (for scan/connect/record updates)
-        self.status_log = QListWidget()
-        self.status_log.setMaximumHeight(150)
-        self.status_log.setStyleSheet("background-color: #f9f9f9; border: 1px solid #ccc;")
-        layout.addWidget(self.status_log)
+        # Remove direct layout status section here; status will be placed beside video list below
 
         # Make plotter/placeholder area status-friendly
         self.plotter_placeholder.setStyleSheet("background-color: white; color: black; font-size: 14px; border: 1px solid #ddd; padding: 8px;")
@@ -297,27 +313,52 @@ class GameplayViewer(QWidget):
 
         self.start_btn.clicked.connect(self.start_gameplay)
 
-        # Add video list panel to left side
+        # Add video list + status panel (side by side)
         left_panel = QVBoxLayout()
-        
+        left_panel.setSpacing(8)
+
         file_label = QLabel("Recent Videos:")
-        file_label.setFont(QFont("Arial", 10, QFont.Bold))
+        file_label.setFont(QFont("Arial", 11, QFont.Bold))
         left_panel.addWidget(file_label)
-        
+
         self.video_list = QListWidget()
         self.video_list.itemDoubleClicked.connect(self.play_selected_video)
+        self.video_list.setMinimumWidth(340)
+        self.video_list.setMinimumHeight(300)
+        self.video_list.setStyleSheet("border: 1px solid #ccc; background: #fff;")
         left_panel.addWidget(self.video_list)
-        
+
         refresh_btn = QPushButton("Refresh List")
+        refresh_btn.setCursor(Qt.PointingHandCursor)
+        refresh_btn.setStyleSheet("QPushButton { padding: 6px 10px; }")
         refresh_btn.clicked.connect(self.refresh_video_list)
         left_panel.addWidget(refresh_btn)
-        
-        # Insert left panel into layout
-        left_container = QWidget()
-        left_container.setLayout(left_panel)
-        left_container.setMaximumWidth(220)
-        layout.insertWidget(0, left_container)
-        
+
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(8)
+
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("font-size: 14px; color: #333; padding: 3px;")
+        right_panel.addWidget(self.status_label)
+
+        self.status_log = QListWidget()
+        self.status_log.setMinimumHeight(300)
+        self.status_log.setStyleSheet("background-color: #f9f9f9; border: 1px solid #ccc;")
+        right_panel.addWidget(self.status_log)
+
+        right_panel.addStretch()
+
+        container_layout = QHBoxLayout()
+        container_layout.setSpacing(10)
+        container_layout.addLayout(left_panel, 1)
+        container_layout.addLayout(right_panel, 1)
+
+        container = QWidget()
+        container.setLayout(container_layout)
+        container.setContentsMargins(0, 6, 0, 6)
+
+        layout.insertWidget(2, container)
+
         self.video_path = None
         self.worker = None
         self.video_windows = []
