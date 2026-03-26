@@ -206,8 +206,9 @@ class RecordingWorker(QThread):
 
                 actor.SetOrientation(rot)
                 actor.SetPosition(pos)
-                plotter.render()
-                frame = plotter.screenshot(return_img=True)
+                with vtk_lock:  # Ensure VTK context is never used concurrently
+                    plotter.render()
+                    frame = plotter.screenshot(return_img=True)
                 writer.append_data(frame)
 
                 if i % 50 == 0:
@@ -221,7 +222,8 @@ class RecordingWorker(QThread):
             traceback.print_exc()
         finally:
             writer.close()
-            plotter.close()
+            with vtk_lock:
+                plotter.close()
             print("Animation creation finished")
 
 
