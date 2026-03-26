@@ -71,8 +71,8 @@ class RecordingWorker(QThread):
 
     async def _async_pipeline(self):
         """Async pipeline implementation"""
-        # Record motion
-        await record_motion()
+        # Record motion (live UI status updates)
+        await record_motion(lambda msg: self.status_update.emit(msg))
 
         if len(ax_data) < 5:
             self.status_update.emit("❌ Not enough data")
@@ -251,16 +251,28 @@ class GameplayViewer(QWidget):
         self.name_input.setPlaceholderText("Enter video name")
 
         self.start_btn = QPushButton("Start Recording")
-        self.watch_btn = QPushButton("Watch Video")
+        self.clear_log_btn = QPushButton("Clear Log")
 
         controls.addWidget(self.name_input)
         controls.addWidget(self.start_btn)
-        controls.addWidget(self.watch_btn)
+        controls.addWidget(self.clear_log_btn)
 
         layout.addLayout(controls)
 
+        self.clear_log_btn.clicked.connect(self.clear_status_log)
+
         self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("font-size: 14px; color: #333; padding: 3px;")
         layout.addWidget(self.status_label)
+
+        # Status history log list (for scan/connect/record updates)
+        self.status_log = QListWidget()
+        self.status_log.setMaximumHeight(150)
+        self.status_log.setStyleSheet("background-color: #f9f9f9; border: 1px solid #ccc;")
+        layout.addWidget(self.status_log)
+
+        # Make plotter/placeholder area status-friendly
+        self.plotter_placeholder.setStyleSheet("background-color: white; color: black; font-size: 14px; border: 1px solid #ddd; padding: 8px;")
 
         # Embedded video playback widget (plays newly recorded or selected video)
         self.video_widget = QVideoWidget()
@@ -268,6 +280,13 @@ class GameplayViewer(QWidget):
         self.media_player.setVideoOutput(self.video_widget)
         self.video_widget.setMinimumHeight(240)
         layout.addWidget(self.video_widget)
+
+        # Connect media player error to fallback
+        self.media_player.error.connect(self.on_media_error)
+        self.media_player.stateChanged.connect(self.on_media_state_changed)
+
+        # Playback speed state used by play_embedded_video and speed controls
+        self._playback_speed = 1.0
 
         # Back button
         bar = QHBoxLayout()
@@ -277,7 +296,6 @@ class GameplayViewer(QWidget):
         layout.addLayout(bar)
 
         self.start_btn.clicked.connect(self.start_gameplay)
-        self.watch_btn.clicked.connect(self.browse_and_play_video)
 
         # Add video list panel to left side
         left_panel = QVBoxLayout()
@@ -374,8 +392,57 @@ class GameplayViewer(QWidget):
         self.worker.start()
 
     def update_status(self, message):
-        """Update status label"""
+        """Update status label and log list"""
         self.status_label.setText(message)
+
+        # Add to status history log with color-coding
+        if hasattr(self, 'status_log'):
+            item = QListWidgetItem(message)
+
+            if any(flag in message.lower() for flag in ['error', 'failed', 'not found']):
+                item.setForeground(Qt.red)
+            elif any(flag in message.lower() for flag in ['success', 'complete', 'connected', 'recording finished']):
+                item.setForeground(Qt.darkGreen)
+            elif any(flag in message.lower() for flag in ['scanning', 'connecting', 'recording', 'creating animation']):
+                item.setForeground(Qt.darkBlue)
+            else:
+                item.setForeground(Qt.black)
+
+            self.status_log.addItem(item)
+            # Keep recent 50 entries to avoid huge list
+            while self.status_log.count() > 50:
+                self.status_log.takeItem(0)
+            self.status_log.scrollToBottom()
+
+        # Also display status in the plotter placeholder / white area
+        if hasattr(self, 'plotter_placeholder') and self.plotter is None:
+            self.plotter_placeholder.setText(message)
+
+    def on_media_error(self, error):
+        """Handle QMediaPlayer errors by falling back to OpenCV playback"""
+        err_msg = self.media_player.errorString()
+        self.update_status(f"⚠️ Embedded player failed: {err_msg}. Using OpenCV fallback.")
+        if hasattr(self, 'current_video_path') and self.current_video_path:
+            self.play_video(self.current_video_path)
+        # Show plotter if it was hidden
+        if hasattr(self, 'plotter') and self.plotter:
+            self.plotter.interactor.show()
+
+    def on_media_state_changed(self, state):
+        """Handle media player state changes"""
+        from PyQt5.QtMultimedia import QMediaPlayer
+        if state == QMediaPlayer.StoppedState:
+            # Show plotter when video stops
+            if hasattr(self, 'plotter') and self.plotter:
+                self.plotter.interactor.show()
+
+    def clear_status_log(self):
+        """Clear the status history log"""
+        if hasattr(self, 'status_log'):
+            self.status_log.clear()
+            self.status_label.setText("Ready")
+            if hasattr(self, 'plotter_placeholder') and self.plotter is None:
+                self.plotter_placeholder.setText("Ready")
 
     def on_recording_finished(self, video_path):
         """Called when recording completes"""
@@ -408,10 +475,6 @@ class GameplayViewer(QWidget):
         # Refresh video list
         self.refresh_video_list()
 
-        # Auto-play newly saved recording in embedded widget
-        if self.video_path and os.path.exists(self.video_path):
-            self.play_embedded_video(self.video_path)
-
     def on_recording_error(self, error_msg):
         """Called when recording fails"""
         QMessageBox.critical(self, "Recording Error", error_msg)
@@ -435,17 +498,71 @@ class GameplayViewer(QWidget):
                 QMessageBox.warning(self, "File Not Found", f"Could not find video:\n{video_name}")
 
     def play_embedded_video(self, video_path):
-        """Play the video inside the app using QMediaPlayer + QVideoWidget"""
-        if not os.path.exists(video_path):
-            QMessageBox.warning(self, "File Not Found", f"Could not find video:\n{video_path}")
+        """Play the video using OpenCV (reliable playback)"""
+        self.play_video(video_path)
+
+    def play_control(self):
+        if self.media_player.media().isNull() and getattr(self, 'current_video_path', None):
+            self.play_embedded_video(self.current_video_path)
             return
 
-        self.media_player.setMedia(QMediaContent(QUrl.fromLocalFile(video_path)))
         self.media_player.play()
-        self.status_label.setText(f"▶ Playing: {os.path.basename(video_path)}")
+        self.status_label.setText("▶ Playback resumed")
+
+    def pause_control(self):
+        self.media_player.pause()
+        self.status_label.setText("⏸ Playback paused")
+
+    def stop_control(self):
+        self.media_player.stop()
+        self.status_label.setText("⏹ Playback stopped")
+
+    def toggle_speed_control(self):
+        speed_map = {1.0: 1.5, 1.5: 2.0, 2.0: 0.5, 0.5: 1.0}
+        self._playback_speed = speed_map.get(self._playback_speed, 1.0)
+        self.media_player.setPlaybackRate(self._playback_speed)
+        self.speed_control_btn.setText(f"Speed x{self._playback_speed}")
+        self.status_label.setText(f"⚡ Speed set to {self._playback_speed}x")
+
+    def watch_most_recent_video(self):
+        """Play the most recently recorded video without opening file explorer"""
+        self.update_status("▶ Watch button clicked")
+
+        # Ensure list is up to date
+        self.refresh_video_list()
+
+        # Priority 1: current latest recording path from this session
+        if getattr(self, 'video_path', None) and os.path.exists(self.video_path):
+            self.update_status(f"▶ Playing current video: {os.path.basename(self.video_path)}")
+            self.play_embedded_video(self.video_path)
+            return
+
+        # Priority 2: most recent MP4 in list
+        if self.video_list.count() > 0:
+            last_item = self.video_list.item(self.video_list.count() - 1)
+            if last_item:
+                video_path = os.path.join(SCRIPT_DIR, last_item.text())
+                if os.path.exists(video_path):
+                    self.update_status(f"▶ Playing latest from list: {last_item.text()}")
+                    self.play_embedded_video(video_path)
+                    return
+
+        # Priority 3: Open dialog fallback
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Video File to Watch",
+            SCRIPT_DIR,
+            "Video Files (*.mp4 *.avi *.mov)"
+        )
+        if filename:
+            self.update_status(f"▶ Playing manually selected video: {os.path.basename(filename)}")
+            self.play_embedded_video(filename)
+            return
+
+        QMessageBox.information(self, "No video", "No recorded video found yet.")
 
     def browse_and_play_video(self):
-        """Browse for and play a video file"""
+        """Browse and play a video file in the embedded player"""
         filename, _ = QFileDialog.getOpenFileName(
             self,
             "Select Video File",
@@ -453,7 +570,7 @@ class GameplayViewer(QWidget):
             "Video Files (*.mp4 *.avi *.mov)"
         )
         if filename:
-            self.play_video(filename)
+            self.play_embedded_video(filename)
 
     def play_video(self, video_path, speed_multiplier=3.0):
         """Play a video file using OpenCV with adjustable speed"""
@@ -479,6 +596,8 @@ class GameplayViewer(QWidget):
                 cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
                 cv2.resizeWindow(window_name, 800, 600)
 
+                close_requested = False
+
                 while cap.isOpened():
                     ret, frame = cap.read()
                     if not ret:
@@ -489,6 +608,7 @@ class GameplayViewer(QWidget):
                     # Handle keyboard input
                     key = cv2.waitKey(frame_delay) & 0xFF
                     if key == ord('q'):
+                        close_requested = True
                         break
                     elif key == 32:  # Spacebar to pause/unpause
                         cv2.waitKey(0)  # Wait indefinitely until any key
@@ -502,7 +622,12 @@ class GameplayViewer(QWidget):
                         print(f"Speed: {current_speed}x")
                     
                     if cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
+                        close_requested = True
                         break
+
+                if not close_requested:
+                    self.status_label.setText("▶ Playback finished. Press any key to close window")
+                    cv2.waitKey(0)
 
                 cap.release()
                 cv2.destroyAllWindows()
@@ -551,7 +676,7 @@ class GameplayViewer(QWidget):
         mesh = pv.read(STL_FILE)
         mesh.translate(-np.array([0.15, 0, 0]))
         mesh.rotate_y(90)
-        mesh.scale([0.15, 0.15, 0.15])
+        mesh.scale([0.10, 0.10, 0.10])
 
         # -------- SAFE UI SETUP --------
         def setup_scene():
@@ -864,17 +989,22 @@ ax_data, ay_data, az_data = [], [], []
 gx_data, gy_data, gz_data = [], [], []
 
 # ---------------- BLE RECORDING ----------------
-async def record_motion():
+async def record_motion(status_callback=None):
 
-    print("Scanning for device...")
+    def _status(msg):
+        print(msg)
+        if status_callback:
+            status_callback(msg)
+
+    _status("Scanning for device...")
     devices = await BleakScanner.discover()
     device = next((d for d in devices if d.name == DEVICE_NAME), None)
 
     if not device:
-        print("Device not found")
+        _status("Device not found")
         return
 
-    print("Connecting to", device.address)
+    _status(f"Connecting to {device.address}")
 
     async with BleakClient(device.address) as client:
 
@@ -902,6 +1032,7 @@ async def record_motion():
                 pass
 
         print("Recording Motion...")
+        _status("Recording Motion...")
         await client.start_notify(CHAR_UUID, notification_handler)
 
         await asyncio.sleep(RECORD_TIME)
