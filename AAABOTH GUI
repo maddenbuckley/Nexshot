@@ -104,6 +104,13 @@ class RecordingWorker(QThread):
         positions = compute_swing_translation(orientations, ax, ay, az)
 
         if self.mode == "SERIAL":
+            positions = smooth_positions(positions, window=61, polyorder=3)
+            orientations = smooth_orientations(orientations, alpha=0.85)
+        else:
+            positions = smooth_positions(positions, window=41, polyorder=3)
+            orientations = smooth_orientations(orientations, alpha=0.65)
+
+        if self.mode == "SERIAL":
             positions = positions - np.mean(positions, axis=0)  # Center around origin for serial mode
 
             max_range = np.max(np.linalg.norm(positions, axis=1))
@@ -112,7 +119,10 @@ class RecordingWorker(QThread):
 
             positions *= 0.5  # Additional scaling for serial mode
 
-        target_frames = int(RECORD_TIME * ANIMATION_FPS * 1.2)  # Reduced from 2x to 1.2x for faster videos
+        if self.mode == "SERIAL":
+            target_frames = int(RECORD_TIME * ANIMATION_FPS)
+        else:
+            target_frames = int(RECORD_TIME * ANIMATION_FPS * 1.2)
         orientations, positions = interpolate_motion(
             orientations, positions, target_frames
         )
@@ -184,10 +194,15 @@ class RecordingWorker(QThread):
 
         try:
             for i, (orientation, pos) in enumerate(zip(orientations, positions)):
-                rot = orientation.as_euler("xyz", degrees=True)
-                if prev_rot is not None:
-                    rot = prev_rot * 0.7 + np.array(rot) * 0.3
-                prev_rot = rot
+                if prev_rot is None:
+                    smooth_orientation = orientation
+                else:
+                    key_rots = R.concatenate([prev_rot, orientation])
+                    slerp = Slerp([0, 1], key_rots)
+                    smooth_orientation = slerp([0.2])[0]
+
+                prev_rot = smooth_orientation
+                rot = smooth_orientation.as_euler("xyz", degrees=True)
 
                 actor.SetOrientation(rot)
                 actor.SetPosition(pos)
@@ -209,7 +224,8 @@ class RecordingWorker(QThread):
             plotter.close()
             print("Animation creation finished")
 
-# ---------------- PADDLE VIEWER ----------------
+
+    # ---------------- PADDLE VIEWER ----------------
 class PaddleViewer(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1007,6 +1023,17 @@ async def record_motion_ble(status_callback=None):
         if status_callback:
             status_callback(msg)
 
+    # First, try to switch Arduino to BLE mode via serial
+    _status("Switching Arduino to BLE mode...")
+    try:
+        ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+        ser.write(b'B')  # Switch to BLE mode
+        time.sleep(0.5)  # Give Arduino time to switch
+        ser.close()
+        _status("Arduino mode switched to BLE")
+    except Exception as e:
+        _status(f"Warning: Could not switch Arduino mode: {e}")
+
     _status("Scanning for device...")
     devices = await BleakScanner.discover()
     device = next((d for d in devices if d.name == DEVICE_NAME), None)
@@ -1044,11 +1071,18 @@ async def record_motion_ble(status_callback=None):
                 print(f"Error parsing data: {e}, data: {data}")
                 pass
 
-        print("Recording Motion...")
+        #print("Recording Motion...")
         _status("Recording Motion...")
         await client.start_notify(CHAR_UUID, notification_handler)
-
-        await asyncio.sleep(RECORD_TIME)
+        
+        # Wait a bit for notifications to start
+        await asyncio.sleep(0.5)
+        
+        start_time = time.time()
+        while time.time() - start_time < RECORD_TIME:
+            await asyncio.sleep(0.1)  # Small sleep to prevent busy waiting
+            if len(ax_data) > 0 and (len(ax_data) % 50) == 0:  # Log progress every 50 samples
+                _status(f"Recording... {len(ax_data)} samples")
 
         await client.stop_notify(CHAR_UUID)
 
@@ -1058,6 +1092,7 @@ async def record_motion_ble(status_callback=None):
 
 # ---------------- SERIAL RECORDING ----------------
 def record_motion_serial(status_callback=None):
+    global ax_data, ay_data, az_data, gx_data, gy_data, gz_data
 
     def _status(msg):
         print(msg)
@@ -1109,6 +1144,16 @@ def record_motion_serial(status_callback=None):
     print("Samples:", len(ax_data))
     print("Rate:", len(ax_data)/RECORD_TIME, "Hz")
 
+    # Apply smoothing to raw sensor data
+    ax_data[:] = smooth_data(ax_data)
+    ay_data[:] = smooth_data(ay_data)
+    az_data[:] = smooth_data(az_data)
+    gx_data[:] = smooth_data(gx_data)
+    gy_data[:] = smooth_data(gy_data)
+    gz_data[:] = smooth_data(gz_data)
+
+    _status("Data smoothing applied")
+
 # ---------------- SMOOTH ----------------
 def smooth_data(data):
 
@@ -1116,6 +1161,38 @@ def smooth_data(data):
         return np.array(data)
 
     return savgol_filter(data, SMOOTH_WINDOW, 3)
+
+
+def smooth_positions(positions, window=31, polyorder=3):
+    """Apply Savitzky-Golay smoothing to position array."""
+    if len(positions) < window:
+        return positions
+
+    if window % 2 == 0:
+        window += 1
+
+    smoothed = np.copy(positions)
+    for idx in range(3):
+        smoothed[:, idx] = savgol_filter(positions[:, idx], window, polyorder)
+    return smoothed
+
+
+def smooth_orientations(orientations, alpha=0.7):
+    """Apply light SLERP smoothing between consecutive orientations."""
+    if len(orientations) < 3:
+        return orientations
+
+    smoothed = [orientations[0]]
+    for i in range(1, len(orientations)):
+        prev = smoothed[-1]
+        target = orientations[i]
+        key_times = [0, 1]
+        key_rots = R.concatenate([prev, target])
+        slerp = Slerp(key_times, key_rots)
+        smoothed.append(slerp([alpha])[0])
+
+    return smoothed
+
 
 # ---------------- RESAMPLE DATA ----------------
 def resample_data(ax, ay, az, gx, gy, gz, target_rate=200):
@@ -1206,6 +1283,9 @@ def compute_swing_translation(orientations, ax, ay, az):
         acc_world[2] -= 1.0
 
         velocity += acc_world * dt
+
+        if len(ax_data) > 0 and np.max(np.abs(ax_data)) > 0:  # safe check
+            velocity *= 0.98
         position += velocity * dt
 
         positions.append(position.copy())
