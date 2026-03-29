@@ -1,4 +1,3 @@
-
 import os
 import sys
 import struct
@@ -226,6 +225,7 @@ class RecordingWorker(QThread):
             writer.close()
             with vtk_lock:
                 plotter.close()
+            del plotter
             print("Animation creation finished")
 
 
@@ -260,6 +260,8 @@ class PaddleViewer(QWidget):
         """Initialize the plotter safely"""
         with vtk_lock:
             try:
+                pv.close_all()  # Ensure no existing VTK windows interfere
+
                 # Remove placeholder
                 layout = self.layout()
                 layout.removeWidget(self.placeholder)
