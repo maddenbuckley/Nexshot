@@ -1,5 +1,7 @@
+
 import os
 import sys
+import struct
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
@@ -1104,57 +1106,36 @@ def record_motion_serial(status_callback=None):
     _status("Opening Serial Port...")
     try:
         ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-        print(f"Serial port {SERIAL_PORT} opened successfully")
     except Exception as e:
         _status(f"Failed to open serial port: {e}")
         return
+    
     time.sleep(2)  # allow Arduino to reset
-
-    # Tell Arduino to switch to SERIAL mode
-    ser.write(b'S')
-    print("Sent 'S' to Arduino")
 
     _status("Recording Motion (Serial)...")
     start_time = time.time()
-    buffer = b''
 
     while time.time() - start_time < RECORD_TIME:
-
-        chunk = ser.read(64)  # read up to 64 bytes
-        if chunk:      
-            buffer += chunk
-
-        while len(buffer) >= 24:  # we have at least one full sample
-            packet = buffer[:24]
-            buffer = buffer[24:]
-
-            vals = np.frombuffer(packet, dtype=np.float32)
-
-            if len(vals) == 6:
-                ax, ay, az, gx, gy, gz = vals
-
+        data = ser.read(24)  # 6 floats × 4 bytes
+        
+        if len(data) == 24:
+            try:
+                ax, ay, az, gx, gy, gz = struct.unpack('6f', data)
+                
                 ax_data.append(ax)
                 ay_data.append(ay)
                 az_data.append(az)
-
                 gx_data.append(gx)
                 gy_data.append(gy)
                 gz_data.append(gz)
+            except:
+                pass
+
     ser.close()
 
     _status("Recording finished (Serial)")
     print("Samples:", len(ax_data))
     print("Rate:", len(ax_data)/RECORD_TIME, "Hz")
-
-    # Apply smoothing to raw sensor data
-    ax_data[:] = smooth_data(ax_data)
-    ay_data[:] = smooth_data(ay_data)
-    az_data[:] = smooth_data(az_data)
-    gx_data[:] = smooth_data(gx_data)
-    gy_data[:] = smooth_data(gy_data)
-    gz_data[:] = smooth_data(gz_data)
-
-    _status("Data smoothing applied")
 
 # ---------------- SMOOTH ----------------
 def smooth_data(data):
