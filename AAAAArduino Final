@@ -1,0 +1,77 @@
+#include <ArduinoBLE.h>
+#include <Arduino_LSM9DS1.h>
+
+// BLE setup
+BLEService customService("19B10000-E8F2-537E-4F6C-D104768A1214");
+BLECharacteristic ble_imu("19B10001-E8F2-537E-4F6C-D104768A1214", BLERead | BLENotify, 24);
+
+// Mode control
+enum Mode { SERIAL_ONLY, BLE_ONLY, BOTH };
+Mode currentMode = BOTH;
+
+void setup() {
+  Serial.begin(9600);
+
+  if (!IMU.begin()) {
+    Serial.println("Failed to initialize IMU!");
+    while (1);
+  }
+
+  if (!BLE.begin()) {
+    Serial.println("BLE failed");
+    while (1);
+  }
+
+  BLE.setLocalName("Nano33BLE_IMU");
+  BLE.setAdvertisedService(customService);
+
+  customService.addCharacteristic(ble_imu);
+  BLE.addService(customService);
+
+  BLE.advertise();
+
+  Serial.println("Ready: Send S (Serial), B (BLE), A (All)");
+}
+
+void loop() {
+  BLEDevice central = BLE.central();
+
+  // 🔹 Check for mode command from Python over Serial
+  if (Serial.available()) {
+    char cmd = Serial.read();
+
+    if (cmd == 'S') {
+      currentMode = SERIAL_ONLY;
+      Serial.println("Mode: SERIAL ONLY");
+    }
+    else if (cmd == 'B') {
+      currentMode = BLE_ONLY;
+      Serial.println("Mode: BLE ONLY");
+    }
+    else if (cmd == 'A') {
+      currentMode = BOTH;
+      Serial.println("Mode: BOTH");
+    }
+  }
+
+  // 🔹 Read IMU once
+  if (IMU.accelerationAvailable() && IMU.gyroscopeAvailable()) {
+
+    float data[6];
+
+    IMU.readAcceleration(data[0], data[1], data[2]);
+    IMU.readGyroscope(data[3], data[4], data[5]);
+
+    // 🔹 Send based on mode
+    if (currentMode == SERIAL_ONLY || currentMode == BOTH) {
+      Serial.write((byte*)data, sizeof(data));
+    }
+
+    if ((currentMode == BLE_ONLY || currentMode == BOTH) &&
+        central && central.connected()) {
+      ble_imu.writeValue((byte*)data, sizeof(data));
+    }
+  }
+
+  BLE.poll(); // keep BLE alive
+}
