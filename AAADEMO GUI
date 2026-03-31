@@ -146,7 +146,8 @@ class RecordingWorker(QThread):
             print(f"Failed to load STL: {e}")
             return
         
-        handle_offset = np.array([0.15, 0, 0])
+        # Raise the paddle pivot to shoulder height for a more natural swing origin
+        handle_offset = np.array([0.15, 0, 0.20])
         mesh.translate(-handle_offset)
         mesh.rotate_y(90)
         if self.mode == "SERIAL":
@@ -161,6 +162,7 @@ class RecordingWorker(QThread):
         plotter.add_axes()
 
         paddle_bounds = mesh.bounds
+        positions += np.array([0.0, 0.0, 0.20])  # lift the motion path to shoulder height
         motion_bounds_min = positions.min(axis=0)
         motion_bounds_max = positions.max(axis=0)
         print(f"Motion bounds min: {motion_bounds_min}, max: {motion_bounds_max}")
@@ -337,6 +339,16 @@ class PaddleViewer(QWidget):
             self.load_core()
             self.core_btn.setText("Show Paddle")
         self.showing_core = not self.showing_core
+
+    def closeEvent(self, event):
+        with vtk_lock:
+            if self.plotter is not None:
+                try:
+                    self.plotter.close()
+                except Exception as e:
+                    print("PaddleViewer close error:", e)
+                self.plotter = None
+        event.accept()
 
 
 # ---------------- GAMEPLAY VIEWER ----------------
@@ -1025,6 +1037,22 @@ class GameplayViewer(QWidget):
         show_frame(0)
         video_window.show()
 
+    def closeEvent(self, event):
+        with vtk_lock:
+            if self.plotter is not None:
+                try:
+                    self.plotter.close()
+                except Exception as e:
+                    print("GameplayViewer close error:", e)
+                self.plotter = None
+
+        # Stop worker thread if running
+        if self.worker and self.worker.isRunning():
+            self.worker.quit()
+            self.worker.wait()
+
+        event.accept() 
+
 # ---------------- CONFIG ----------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -1362,7 +1390,7 @@ def animate_paddle():
     # read paddle mesh
     mesh = pv.read(STL_FILE)
     #mesh.translate(-np.array(mesh.center))
-    handle_offset = np.array([0.15, 0, 0])  # adjust based on actual model    
+    handle_offset = np.array([0.15, 0, 0.20])  # adjust based on actual model    
     mesh.translate(-handle_offset)
     mesh.rotate_y(90)
 
@@ -1458,6 +1486,19 @@ class NexshotMain(QMainWindow):
             self.paddle_page.load_default()
         except Exception:
             pass
+
+    def closeEvent(self, event):
+        try:
+            if hasattr(self, "paddle_page"):
+                self.paddle_page.close()
+
+            if hasattr(self, "gameplay_page"):
+                self.gameplay_page.close()
+
+        except Exception as e:
+            print("Main window cleanup error:", e)
+
+        event.accept()
 
 
 # ---------------- RUN APP ----------------
