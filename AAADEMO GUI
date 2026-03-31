@@ -246,10 +246,21 @@ class PaddleViewer(QWidget):
         bar = QHBoxLayout()
         self.back_btn = QPushButton("Back")
         self.core_btn = QPushButton("Show Core")
+        self.cart_top_btn = QPushButton("Cartridge Top")
+        self.cart_bottom_btn = QPushButton("Cartridge Bottom")
+
         self.core_btn.setCursor(Qt.PointingHandCursor)
+        self.cart_top_btn.setCursor(Qt.PointingHandCursor)
+        self.cart_bottom_btn.setCursor(Qt.PointingHandCursor)
+
         self.core_btn.clicked.connect(self.on_core_button_clicked)
+        self.cart_top_btn.clicked.connect(self.load_cartridge_top)
+        self.cart_bottom_btn.clicked.connect(self.load_cartridge_bottom)
+
         bar.addWidget(self.back_btn)
         bar.addWidget(self.core_btn)
+        bar.addWidget(self.cart_top_btn)
+        bar.addWidget(self.cart_bottom_btn)
         bar.addStretch()
         main.addLayout(bar)
         
@@ -311,6 +322,24 @@ class PaddleViewer(QWidget):
         path = os.path.join(script_dir, "core.stl")
 
         self._load_model(path, default_color="dodgerblue")
+
+    def load_cartridge_top(self):
+        if self.plotter is None:
+            return
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "cartridge top.stl")
+
+        self._load_model(path, default_color="mediumvioletred")
+
+    def load_cartridge_bottom(self):
+        if self.plotter is None:
+            return
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(script_dir, "cartridge bottom.stl")
+
+        self._load_model(path, default_color="orange")
 
     def _load_model(self, path, default_color="gray"):
         if not os.path.exists(path):
