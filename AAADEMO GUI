@@ -352,9 +352,29 @@ class PaddleViewer(QWidget):
 
         try:
             mesh = pv.read(path)
+            mesh.compute_normals(cell_normals=False, inplace=True)
             self.plotter.clear()
             self.plotter.add_axes()
-            self.plotter.add_mesh(mesh, show_edges=False, smooth_shading=True, color=default_color)
+            self.plotter.add_mesh(
+                mesh,
+                color=default_color,
+                smooth_shading=True,
+                ambient=0.4,
+                specular=0.5,
+                metallic=0.1,
+                roughness=0.3,
+            )
+
+            base_name = os.path.basename(path).lower()
+            if base_name in ["cartridge top.stl", "cartridge bottom.stl"]:
+                self.plotter.add_mesh(
+                    mesh,
+                    style="wireframe",
+                    color="black",
+                    line_width=3,
+                    opacity=0.9,
+                )
+
             self.plotter.reset_camera()
             self.plotter.view_isometric()
         except Exception as e:
